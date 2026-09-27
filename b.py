@@ -1,10 +1,8 @@
 import glob
 import os
 import random
-import threading
-from time import sleep
 import traceback
-from types import NoneType
+
 import mutagen.flac
 import mutagen.id3
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,66 +23,123 @@ class player:
         self.player= vlc.Instance(" ".join(params))
         self.music_message = {}
         self.music_photo = None
-        self.listen_thread = None
+
         self.play_tt = 0
-        self.stop_flag = threading.Event()
-        self.stop_lock = threading.Lock()
+
         self.music_player = vlc.MediaPlayer(self.player)
         self.music_dict = d
-        self.listb:ttkbootstrap.Listbox;NoneType = None
-    def set_d(self,d,l):self.music_dict=d;self.listb = l
+        # 注意:这里必须真正赋值,只写注解不会创建属性,
+        # 否则 set_d() 之前访问 self.listb 会 AttributeError
+        self.listb: "ttkbootstrap.Listbox | None" = None
+    def add_listen(self,event,func,*args):
+        self.music_player.event_manager().event_attach(event,func,*args)
+    def del_listen(self,event):
+        self.music_player.event_manager().event_detach(event)
+    def set_d(self,d:dict,l:"ttkbootstrap.Listbox"):
+        self.music_dict = d
+        self.listb = l
     def set_a(self,aint):
-        if 0<=aint<=3:self.play_tt = aint
-    def play_backbround_listen(self,path,end_action,event:threading.Event):
-        event.clear()
-        while True:
-            sleep(1)
-            with self.stop_lock:
-                if event.is_set():break
-                if self.music_player.get_state() == vlc.State.Ended:
-                    match self.play_tt:
-                        case 0:
-                            
-                            self.set_media_path(self.music_message.get('name',''),path,end_action,False)
-                            self.play()
-                            end_action()
-                        case 1:
-                            a = list(self.music_dict.keys())
-                            try:n = self.music_message.get('name','')
-                            except Exception:traceback.print_exc()
-                            an = 0
-                            if n in a:
-                                an = a.index(n)+1
-                                if an == len(a):an = 0
-                                print(a[an])
-                            self.set_media_path(a[an],self.music_dict.get(a[an]),end_action,False)
-                            self.play()
-                            end_action()
-                            self.listb.selection_clear(0,tkinter.END)
-                            self.listb.selection_set(an)
-                            break
-                        case 2:
-                            a = list(self.music_dict.keys())
-                            an= random.choice(a)
-                            self.set_media_path(an,self.music_dict.get(an),end_action,False)
-                            self.play()
-                            nd =a.index(an)
-                            self.listb.selection_clear(0,tkinter.END)
-                            self.listb.selection_set(nd)
-                            end_action()
-                            break
+        # play_tt 只有 0/1/2 三种有实现,允许 3 会变成"切了模式但行为不变"
+        if 0<=aint<=2:self.play_tt = aint
+    def play_backbround_listen(self,event,path,end_action):
+        """
+        MediaPlayerEndReached 的回调,运行在 libvlc 的事件线程里。
+        libvlc 不可重入,所以这里绝不能调用 set_mrl/play/event_detach,
+        只把真正的切歌动作排队到 Tk 主线程再执行。
+        """
+        print(event)
+        lb = self.listb
+        if lb is None:
+            print('listb 未初始化,忽略本次切歌')
+            return
+        lb.after(0,lambda:self._advance(path,end_action))
+
+    def _select_index(self,index):
+        lb = self.listb
+        if lb is None:
+            return
+        lb.selection_clear(0,tkinter.END)
+        lb.selection_set(index)
+        lb.see(index)
+
+    def _advance(self,path,end_action):
+        """真正切歌,运行在 Tk 主线程里。"""
+        # 同一事件类型只需要一个回调:先摘掉旧的,再由 set_media_path 按新参数重新注册。
+        # 少了这一步,EndReached 监听就是一次性的,切完这一首就再也不会自动切歌。
+        self.del_listen(vlc.EventType.MediaPlayerEndReached)
+
+
+
+        match self.play_tt:
+            case 0:       
+                name = self.music_message.get('name','')
+                ok = self.set_media_path(name,path,end_action)
+                self._after_switch(ok,path,end_action)
+                
+            case 1:
+                a = list(self.music_dict.keys())
+                if not a:
+                    print('曲库为空,停止切歌')
+                    return
+                n = self.music_message.get('name','')
+                an = a.index(n)+1 if n in a else 0
+                if an == len(a):an = 0
+                print(a[an])
+                ok = self.set_media_path(a[an],(self.music_dict.get(a[an]) or {}).get("music",""),end_action)
+                if ok:self._select_index(an)
+                self._after_switch(ok,path,end_action)
+                
+            case 2:
+                a = list(self.music_dict.keys())
+                if not a:
+                    print('曲库为空,停止切歌')
+                    return
+                an = random.choice(a)
+                ok = self.set_media_path(an,(self.music_dict.get(an) or {}).get("music",""),end_action)
+                if ok:self._select_index(a.index(an))
+                self._after_switch(ok,path,end_action)
+            case _:
+                print(f'未知播放模式:{self.play_tt}')
+
             
                         
 
 
+    def _after_switch(self,ok,path,end_action):
+        if not ok:
+            # 目标文件无效:把原来的监听重新挂回去,别把整条播放链弄断
+            self.add_listen(vlc.EventType.MediaPlayerEndReached,self.play_backbround_listen,path,end_action)
+            return
+        self.play()
+        end_action()
+
+    def set_media_path_mv(self,name,path):
+        # 目前没有调用点(MV 模式还没接入),保留给后面用
+        if not path or path == 'no<>found':
+            ttkbootstrap.Messagebox.show_warning('未指定文件')
+            return False
+        self.music_player.set_mrl(path)
+        mini = (self.music_dict.get(name) or {}).get('music',None)
+        if mini:
+            self.load_message(name,mini)
+        else:self.music_photo = Image.open(os.path.join(BASE_DIR,'a.png'))
+        return True
+
 
     def set_media_path(self,name,path,end_action,b=True):
+        """设置要播放的文件。返回 False 表示没有可播放的文件。"""
+        if not path or path == 'no<>found':
+            ttkbootstrap.Messagebox.show_warning('未指定文件')
+            return False
+            
         self.music_player.set_mrl(path)
         
         if b:
-            self.stop_flag = threading.Event()
-            self.listen_thread = threading.Thread(target=self.play_backbround_listen,args=(path,end_action,self.stop_flag),daemon=True,name='play_backround')
-            self.listen_thread.start()
+            self.add_listen(vlc.EventType.MediaPlayerEndReached,self.play_backbround_listen,path,end_action)
+        self.load_message(name,path)
+        return True
+
+    def load_message(self,name,path):
         try:
             a = mutagen.File(path,easy=True)
             bd = {}
@@ -107,17 +162,17 @@ class player:
                     self.music_photo = Image.open(io.BytesIO(pic.data))
             else :self.music_photo = Image.open(os.path.join(BASE_DIR,'a.png'))
         except Exception as w:print(w) 
-    def play(self):return self.music_player.play()
-    def pause(self):self.music_player.pause()
-    def stop(self):
+    def play(self) -> int:return self.music_player.play()
+    def pause(self) -> None:self.music_player.pause()
+    def stop(self) -> None:
         self.music_player.stop()
-        with self.stop_lock:
-            self.stop_flag.set()
+        self.del_listen(vlc.EventType.MediaPlayerEndReached)
+
     def set_time(self,time):"""time's Unit is seconds""";self.music_player.set_time(time*1000)
-    def time_add_ten(self):
+    def time_add_ten(self) -> None:
         if self.music_player.get_state() in (vlc.State.Playing,vlc.State.Paused):self.music_player.set_time(self.music_player.get_time()+10000)
-    def time_minus_ten(self):
-        if self.music_player.get_state() in (vlc.State.Playing,vlc.State.Paused):self.music_player.set_time(self.music_player.get_time()-10000)
+    def time_minus_ten(self) -> None:
+        if self.music_player.get_state() in (vlc.State.Playing,vlc.State.Paused):self.music_player.set_time(max(self.music_player.get_time()-10000,0))
 
             
 def fmt_time(ms):
@@ -147,6 +202,7 @@ class SeekBar(ttkbootstrap.Frame):
 
         self._dragging = False
         self._after_id = None
+        self._destroyed = False
         self._total = 0
 
         self.scale = ttkbootstrap.Scale(self, from_=0, to=self.SCALE_MAX,
@@ -162,7 +218,18 @@ class SeekBar(ttkbootstrap.Frame):
         self.scale.bind("<ButtonRelease-1>", self._on_release)
         self.scale.configure(command=self._on_scale_move)
 
+        # 窗口销毁时要停掉轮询,否则会在已销毁的控件上继续 after -> TclError
+        self.bind("<Destroy>",self._on_destroy)
         self._start_poll()
+
+    def _on_destroy(self,event):
+        if event.widget is not self:
+            return
+        self._destroyed = True
+        if self._after_id is not None:
+            try:self.after_cancel(self._after_id)
+            except Exception:pass
+            self._after_id = None
 
     # ---------- 用户拖动 ----------
     def _on_press(self, _event):
@@ -187,6 +254,8 @@ class SeekBar(ttkbootstrap.Frame):
         self._poll()
 
     def _poll(self):
+        if self._destroyed:
+            return
         mp = self.media_player
         if not self._dragging:
             self._total = mp.get_length() or 0
@@ -205,19 +274,22 @@ class SeekBar(ttkbootstrap.Frame):
 
 class plugin:
     def __init__(self,file):
-        n = json.load(open(file,'r',encoding='utf-8'))
+        with open(file,'r',encoding='utf-8') as fp:
+            n = json.load(fp)
         self.com = compile(n.get('command',''),"<string>","exec")
         self.init_command = compile(n.get('init',''),"<string>","exec")
         self.name = n.get('name','')
         self.can_exec = n.get('CanExec',False)
         self.exec_path = n.get('ExecPath',[])
+        # 插件用独立的命名空间:既能拿到 b.py 里的名字,又不会把插件写的东西
+        # 塞进 b.py 的全局命名空间;init 和 run 共用同一个 dict,
+        # 插件在 init 里定义的东西在 run 时还在。
+        self.kk = dict(globals())
         
     def init(self,tkaapp=None):
-        self.kk = globals()
         self.kk['tkapp'] = tkaapp
         if self.can_exec:exec(self.init_command,self.kk)
     def run(self,tkaapp=None):
-        self.kk = globals()
         self.kk['tkapp'] = tkaapp
         if self.can_exec:exec(self.com,self.kk)
             
@@ -226,22 +298,24 @@ class tkapp:
     def __init__(self):
         self.music_dict = {}
         self.player = player(self.music_dict)
-        self.index = 0
-        self.app= ttkbootstrap.Tk('music','64')
+        self.index: "int | None" = None     # 当前选中项(整数索引,不是 curselection 返回的元组)
+        self.app= ttkbootstrap.Tk('music','64')   # 第二个参数是主题名,'64' 不是合法主题(会被忽略)
         
         self.app.title('music')
         self.app.geometry("800x600+20+200")
         self.app.rowconfigure(0, weight=10)
         self.app.rowconfigure(1, weight=1)
         self.app.rowconfigure(2, weight=10)
-        self.app.columnconfigure((0), weight=3)
-        self.app.columnconfigure((1), weight=1)
+        self.app.columnconfigure(0, weight=3)
+        self.app.columnconfigure(1, weight=1)
         self.a = ttkbootstrap.Style()
         print(self.a.theme_names())
         if 'solarized-light' in self.a.theme_names():
             self.a.theme_use('solarized-light')
 
-        self.app.iconphoto(True,ImageTk.PhotoImage(Image.open('a.png').resize((16,16))))
+        # PhotoImage 必须留下引用,否则对象被回收后窗口图标会消失
+        self._icon_image = ImageTk.PhotoImage(Image.open(os.path.join(BASE_DIR,'a.png')).resize((16,16)))
+        self.app.iconphoto(True,self._icon_image)
 
         self.dis_f = ttkbootstrap.Frame(self.app)
         self.dis_f.grid(row=0,column=0,sticky='nsew')
@@ -273,7 +347,7 @@ class tkapp:
         self.dis_f.rowconfigure([0,1],weight=1)
         self.dis_f.columnconfigure([0,1],weight=1)
 
-        ph = ImageTk.PhotoImage(Image.open('a.png').resize((int(600/4),int(600/4))))
+        ph = ImageTk.PhotoImage(Image.open(os.path.join(BASE_DIR,'a.png')).resize((int(600/4),int(600/4))))
         self.music_image = ttkbootstrap.Label(self.dis_f,image=ph)
         self.lll = ph
         self.music_name = ttkbootstrap.Label(self.dis_f)
@@ -331,9 +405,11 @@ class tkapp:
 
 
 
-        if os.path.isdir(os.path.join(BASE_DIR,'music')):
-            self.flush_music()
-        else: os.mkdir('music');self.flush_music()
+        music_dir = os.path.join(BASE_DIR,'music')
+        if not os.path.isdir(music_dir):
+            # 原来这里用 os.mkdir('music'),会在当前工作目录下建目录
+            os.makedirs(music_dir,exist_ok=True)
+        self.flush_music()
 
 
     def play(self):
@@ -341,21 +417,26 @@ class tkapp:
         self.player.play()
     def pause(self):
         for xnn in self.run_pause_list:xnn(self)
-        self.player.play()
+        self.player.pause()
     
     
     def flush_display(self):
+        msg = self.player.music_message
         if self.player.music_photo:
-                size = max(self.app.winfo_height() // 4, 32)
-                self.lll = ImageTk.PhotoImage(self.player.music_photo.resize((size, size)))
-                self.music_image.config(image=self.lll)
-        b = ','.join(self.player.music_message.get('title',['unknow']))
-        c = ','.join(self.player.music_message.get('artist',['unknow']))
-        if not b:b = 'unknow'
-        if not c:c = 'unknow'
+            size = max(self.app.winfo_height() // 4, 32)
+            self.lll = ImageTk.PhotoImage(self.player.music_photo.resize((size, size)))
         self.music_image.config(image=self.lll)
-        self.music_name.config(text=f'标题:{b}')
-        self.music_maker_name.config(text=f'作者:{c}')
+
+        def tag_text(key):
+            # mutagen easy=True 取出来是 list,但也可能被写成 str,
+            # 直接 join(str) 会得到 "雨,爱" 这种逐字符结果
+            v = msg.get(key)
+            if not v:v = ['unknow']
+            if isinstance(v,str):v = [v]
+            return ','.join(str(x) for x in v if x) or 'unknow'
+
+        self.music_name.config(text=f'标题:{tag_text("title")}')
+        self.music_maker_name.config(text=f'作者:{tag_text("artist")}')
 
     def change_mode(self,event):
         a = self.cpls.get()
@@ -364,48 +445,73 @@ class tkapp:
             case '单曲循环':self.player.set_a(0)
             case '顺序播放':self.player.set_a(1)
             case '随机播放':self.player.set_a(2)
+            case _:print(f'未知播放模式:{a}')
     def change_music(self,event):
         for xnn in self.run_listbox_list:xnn(self)
         sel = self.dfl.curselection()
         if not sel:return      # 选择被别处抢走(切播放模式/重建列表)时直接忽略
-        a = self.dfl.get(sel)
-        file = self.music_dict.get(a)
-        
+        idx = int(sel[0])
+        a = self.dfl.get(idx)
+        file = (self.music_dict.get(a) or {}).get("music",'no<>found')
+
+        # 先确认文件有效再停当前音乐,避免"点了是却只弹个警告然后静音"
+        if not file or file == 'no<>found':
+            ttkbootstrap.Messagebox.show_warning('未指定文件',parent=self.app)
+            self._restore_selection()
+            return
+
         aaa = ttkbootstrap.Messagebox.yesno('是否切换音乐','music player',buttons=['是','否'])
         if aaa == '是':
             self.player.stop()
             self.player.set_media_path(a,file,self.flush_display)
             self.flush_display()
+            self.index = idx
         else:
-            self.dfl.selection_clear(0, tkinter.END)
-            self.dfl.select_set(self.index)
-        self.index = self.dfl.curselection()
+            self._restore_selection()
+
+    def _restore_selection(self):
+        self.dfl.selection_clear(0, tkinter.END)
+        if self.index is not None and 0 <= self.index < self.dfl.size():
+            self.dfl.selection_set(self.index)
 
 
     def flush_music(self):
         self.music_dict=self.load_music()
-        a = self.music_dict.keys()
+        keys = list(self.music_dict.keys())
         self.player.set_d(self.music_dict,self.dfl)
         self.dfl.delete(0,tkinter.END)
-        for asa in a:
+        for asa in keys:
             self.dfl.insert(tkinter.END,asa)
 
 
     def load_music(self):
         aaa = {}
-        for a in  os.listdir(os.path.join('.','music')):
-            b = os.path.join('.','music',a)
-            if os.path.isdir(b):
-                if os.path.isfile(os.path.join(b,'info.json')):
-                    n:dict = json.load(open(os.path.join(b,'info.json'),'r',encoding='utf-8'))
-                    try:
-                        name = n.get('name',None)
-                        file = n.get('file',None)
-                    except Exception as e:
-                        print(e)
-                        continue
-                    if os.path.isfile(os.path.join(b,file)):
-                        aaa[name]= os.path.join(b,file)
+        music_dir = os.path.join(BASE_DIR,'music')
+        for a in os.listdir(music_dir):
+            b = os.path.join(music_dir,a)
+            if not os.path.isdir(b):
+                continue
+            info = os.path.join(b,'info.json')
+            if not os.path.isfile(info):
+                continue
+            # json 读取才是会抛异常的步骤,必须包在这里面
+            try:
+                with open(info,'r',encoding='utf-8') as fp:
+                    n:dict = json.load(fp)
+            except Exception as e:
+                print(f'读取 {info} 失败:{e}')
+                continue
+            name = n.get('name') or a        # 缺 name 时退回目录名,不让 None 进列表
+            file = n.get('file','no<>found')
+            video = n.get('mv','no<>found')
+            # 文件不存在时统一用哨兵,交给 set_media_path 去提示,
+            # 不能把 info.json 里的原始文件名当路径用(那是相对路径,会解析到别处)
+            music = os.path.join(b,file) if os.path.isfile(os.path.join(b,file)) else 'no<>found'
+            video = os.path.join(b,video) if os.path.isfile(os.path.join(b,video)) else 'no<>found'
+            if music == 'no<>found' and video == 'no<>found':
+                print(f'跳过 {a}:没有可播放的文件')
+                continue
+            aaa[name] = {'music':music,'video':video}
         print(aaa)
         return aaa
 
@@ -416,4 +522,4 @@ try:
     if __name__ == "__main__":
         a = tkapp()
         a.run()
-except Exception as a:print(a)
+except Exception as a:print(a);traceback.print_exc()

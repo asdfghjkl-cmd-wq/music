@@ -7,9 +7,10 @@ music/as/info.json
 music/n/a.mp3
 music/n/info.json
 music/n - 副本/a.mp3
-music/n - 副本/info.json
+music/
 plugin/a.json
 
 bili_audio.py
 a.py
 cookies.txt
+__pycache__/b.cpython-313.pyc
