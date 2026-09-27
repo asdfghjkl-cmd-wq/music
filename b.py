@@ -183,7 +183,10 @@ class player:
             if name in keys:
                 self._select_index(keys.index(name))
         self._after_switch(ok,path,end_action)
-
+    def set_volume(self,volume):
+        self.music_player.audio_set_volume(volume)
+    def get_volume(self):
+        return self.music_player.audio_get_volume()
     def _after_switch(self,ok,path,end_action):
         if not ok:
             # 目标文件在这一瞬间变得不可用(极少见)。原来这里拿"上一首"的 path
@@ -246,8 +249,12 @@ class player:
                     self.music_message['pic_mine'] = pic.mime
                     self.music_photo = Image.open(io.BytesIO(pic.data))
         except Exception as w:print(w) 
-    def play(self) -> int:return self.music_player.play()
-    def pause(self) -> None:self.music_player.pause()
+    def play(self,l:ttkbootstrap.Label) -> int:
+        self.listb.after(0,l.config(text='播放'))
+        return self.music_player.play()
+    def pause(self,l) -> None:
+        self.listb.after(0,l.config(text='暂停'))
+        self.music_player.pause()
     def stop(self) -> None:
         self.music_player.stop()
         self.del_listen(vlc.EventType.MediaPlayerEndReached)
@@ -364,10 +371,7 @@ class SeekBar(ttkbootstrap.Frame):
 
 class plugin:
     def __init__(self,dir):
-        # 读配置整体容错:文件缺失、编码不是 utf-8(中文 Windows 上手写配置很常见)、
-        # json 语法错、没权限,都不该把整个程序启动带崩。原来 if 不成立时 n 根本没绑定,
-        # 下一行 n.get 直接 UnboundLocalError,而调用点在 tkapp.__init__ 的插件循环里
-        # 且没有 try,于是启动就整个失败了。
+
         cfg = os.path.join(dir,'plugin.json')
         n = {}
         try:
@@ -382,7 +386,6 @@ class plugin:
         self.init = n.get('init','')
         init_file = n.get('init_file','')
         if init_file:
-            # 插件的外部代码文件同样不可信:缺文件/编码错都只跳过,不该让启动崩掉
             try:
                 with open(os.path.join(dir,init_file),'r',encoding="utf-8") as fp:
                     self.init = fp.read()
@@ -434,7 +437,8 @@ class tkapp:
         self.player = player(self.music_dict)
         self.index: "int | None" = None     # 当前选中项(整数索引,不是 curselection 返回的元组)
         self.app= ttkbootstrap.Tk('music')   # 第二个参数是主题名,'64' 不是合法主题(会被忽略)
-        
+
+        self.app.protocol('WM_DELETE_WINDOW',self.on_closing)
         self.app.title('music')
         self.app.geometry("800x600+20+200")
         self.app.rowconfigure(0, weight=10)
@@ -453,15 +457,23 @@ class tkapp:
         self.dis_f = ttkbootstrap.Frame(self.app)
         self.dis_f.grid(row=0,column=0,sticky='nsew')
 
-        self.but_f = ttkbootstrap.Frame(self.app)
-        self.but_f.grid(row=0,column=1)
+        self.con_f = ttkbootstrap.Frame(self.app)
+        self.con_f.grid(row=0,column=1)
 
-        self.play_button = ttkbootstrap.Button(self.but_f,text='播放',command=self.play)
-        self.pause_button = ttkbootstrap.Button(self.but_f,text='暂停',command=self.pause)
+        self.mvv = tkinter.IntVar(value=100)
+        self.music_label = ttkbootstrap.Label(self.con_f,text='音量:100')
+        self.music_volume = ttkbootstrap.Scale(self.con_f,from_=0,to=100,value=100,variable=self.mvv,command=self.vpu)
+        self.music_volume.bind()
+        self.music_label.pack()
+        self.music_volume.pack()
+        self.play_status_label = ttkbootstrap.Label(self.con_f,text="无")
+        self.play_status_label.pack()
+        self.play_button = ttkbootstrap.Button(self.con_f,text='播放',command=self.play)
+        self.pause_button = ttkbootstrap.Button(self.con_f,text='暂停',command=self.pause)
         self.play_button.pack(side='top')
         self.pause_button.pack(side='top')
         self.cpls = tkinter.StringVar(value='单曲循环')
-        self.cpl = ttkbootstrap.Combobox(self.but_f,height=3,width=10,values=['单曲循环','顺序播放','随机播放'],textvariable=self.cpls,state='readonly')
+        self.cpl = ttkbootstrap.Combobox(self.con_f,height=3,width=10,values=['单曲循环','顺序播放','随机播放'],textvariable=self.cpls,state='readonly')
         self.cpl.pack(side='bottom')
         self.cpl.bind("<<ComboboxSelected>>",self.change_mode)
 
@@ -500,19 +512,28 @@ class tkapp:
         self.dfl = ttkbootstrap.Listbox(self.df,selectmode=tkinter.SINGLE,exportselection=False,yscrollcommand=self.scrollbar.set)
         self.scrollbar.config(command=self.dfl.yview)
         self.dfl.grid(row=0,column=0,sticky='nsew')
+        if os.path.isfile(os.path.join(BASE_DIR,'exit')):
+            e = open(os.path.join(BASE_DIR,'exit'),'r',encoding='utf-8').read()
+        else:e = '0'
+        if e.isdecimal():
+            self.exit_fun = int(e)
+        else:
+            self.exit_fun == 0
 
-
-        
         
         self.menu = ttkbootstrap.Menu(self.app)
 
         self.menu.add_command(label='重加载音乐列表',command=self.flush_music)
-        self.menu.add_separator()
+
+        self.menu.add_command(label='设置',command=self.setting)
+        
         self.app.config(menu=self.menu)
 
+        self.music_mode = True
         
         self.menu.add_command(label='mv',command=self.mv_play)
         self.menu.add_command(label='music',command=self.back_music)
+        self.menu.add_separator()
         self.screen = ttkbootstrap.Canvas(self.app)
 
         self.plugin_list = []
@@ -520,6 +541,7 @@ class tkapp:
         self.run_pause_list = []
         self.run_listbox_list = []
 
+        
         self.scrollbar.grid(row=0,column=1,sticky='n')
         self.dfl.bind('<<ListboxSelect>>', self.change_music)
         if os.path.exists(os.path.join(BASE_DIR,'plugin')) and os.path.isdir(os.path.join(BASE_DIR,'plugin')):
@@ -548,16 +570,46 @@ class tkapp:
             # 原来这里用 os.mkdir('music'),会在当前工作目录下建目录
             os.makedirs(music_dir,exist_ok=True)
         self.flush_music()
+    def on_closing(self):
+        if self.exit_fun == 0:
+            self.app.destroy()
+            exit(0)
+        elif self.exit_fun == 1:
+            pass
+        else :
+            a = ttkbootstrap.Messagebox.yesnocancel('选y以关闭程序,选n以关闭窗口,选c以取消')
+    def setting(self):
+        a = ttkbootstrap.Toplevel('setting',iconphoto=self._icon_image,size=(200,200))
+        v = tkinter.IntVar()
+        v.set(2) # 设置默认选中的值
 
+        # 创建三个 Radiobutton 组件
+        ttkbootstrap.Radiobutton(a, text="直接退出", variable=v, value=1).pack(anchor="w")
+        ttkbootstrap.Radiobutton(a, text="仅关闭窗口", variable=v, value=2).pack(anchor="w")
+        ttkbootstrap.Radiobutton(a, text="询问", variable=v, value=3).pack(anchor="w")
 
+        def save():
+            self.exit_fun = v.get()
+            open('exit','w',encoding='utf-8').write(int(self.exit_fun))
+        ttkbootstrap.Button(a,text='保存',command=save).pack()
+
+    def vpu(self,a):
+        b = round(float(a))
+        self.music_label.config(text=f"音量:{b}")
+        self.player.set_volume(b)
     def play(self):
         for xnn in self.run_play_list:xnn(self)
-        self.player.play()
+        
+        self.player.play(self.play_status_label)
     def pause(self):
         for xnn in self.run_pause_list:xnn(self)
-        self.player.pause()
+        self.player.pause(self.play_status_label)
+
+    def play_status_listen(self):
+        self.player.music_player.get_state() 
     
     def mv_play(self):
+        self.music_mode = False
         self.dis_f.grid_remove()
         self.player.del_listen(vlc.EventType.MediaPlayerEndReached)
         self.screen.grid(row=0,column=0,sticky='nsew')
@@ -573,8 +625,12 @@ class tkapp:
             self.player.set_media_path_mv(x,self.music_dict.get(x,'').get('video'))
         
     def back_music(self):
+        self.music_mode = True
         self.screen.grid_remove()
         self.dis_f.grid()
+        x = self.player.music_message.get('name','')
+        if x and self.music_dict.get(x).get('music') != 'no<>found':
+            self.player.set_media_path(x,self.music_dict.get(x,'').get('music'),self.flush_display)
     def flush_display(self):
         msg = self.player.music_message
         if self.player.music_photo:
@@ -600,32 +656,56 @@ class tkapp:
             case '顺序播放':self.player.set_a(1)
             case '随机播放':self.player.set_a(2)
             case _:print(f'未知播放模式:{a}')
+
+
     def change_music(self,event):
         for xnn in self.run_listbox_list:xnn(self)
         sel = self.dfl.curselection()
         if not sel:return      # 选择被别处抢走(切播放模式/重建列表)时直接忽略
         idx = int(sel[0])
         a = self.dfl.get(idx)
-        file = (self.music_dict.get(a) or {}).get("music",'no<>found')
+        if self.music_mode:
+            file = (self.music_dict.get(a) or {}).get("music",'no<>found')
 
-        # 先确认文件有效再停当前音乐,避免"点了是却只弹个警告然后静音"
-        if not file or file == 'no<>found':
-            ttkbootstrap.Messagebox.show_warning('未指定文件',parent=self.app)
-            self._restore_selection()
-            return
+            # 先确认文件有效再停当前音乐,避免"点了是却只弹个警告然后静音"
+            if not file or file == 'no<>found':
+                ttkbootstrap.Messagebox.show_warning('未指定文件',parent=self.app)
+                self._restore_selection()
+                return
 
-        aaa = ttkbootstrap.Messagebox.yesno('是否切换音乐','music player',buttons=['是','否'])
-        if aaa == '是':
-            self.player.stop()
-            if self.player.set_media_path(a,file,self.flush_display):
-                self.index = idx
-                self.player.play()   # 原来漏了这一句:确认切歌后停在静音状态,要再点一次"播放"
-                self.flush_display()
+            aaa = ttkbootstrap.Messagebox.yesno('是否切换音乐','music player',buttons=['是','否'])
+            if aaa == '是':
+                self.player.stop()
+                if self.player.set_media_path(a,file,self.flush_display):
+                    self.index = idx
+                    self.player.play(self.play_status_label)   # 原来漏了这一句:确认切歌后停在静音状态,要再点一次"播放"
+                    self.flush_display()
+                else:
+                    # set_media_path 内部已经弹过警告了,这里把选择框拨回实际在播的那首
+                    self._restore_selection()
             else:
-                # set_media_path 内部已经弹过警告了,这里把选择框拨回实际在播的那首
                 self._restore_selection()
         else:
-            self._restore_selection()
+            file = (self.music_dict.get(a) or {}).get("video",'no<>found')
+            
+            # 先确认文件有效再停当前音乐,避免"点了是却只弹个警告然后静音"
+            if not file or file == 'no<>found':
+                ttkbootstrap.Messagebox.show_warning('未指定文件',parent=self.app)
+                self._restore_selection()
+                return
+            
+            aaa = ttkbootstrap.Messagebox.yesno('是否切换视频','music player',buttons=['是','否'])
+            if aaa == '是':
+                self.player.stop()
+                if self.player.set_media_path_mv(a,file):
+                    self.index = idx
+                    self.player.play(self.play_status_label)   # 原来漏了这一句:确认切歌后停在静音状态,要再点一次"播放"
+
+                else:
+                    # set_media_path 内部已经弹过警告了,这里把选择框拨回实际在播的那首
+                    self._restore_selection()
+            else:
+                self._restore_selection()
 
     def _restore_selection(self):
         self.dfl.selection_clear(0, tkinter.END)
