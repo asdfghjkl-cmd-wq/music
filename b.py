@@ -1,4 +1,5 @@
 import os
+import platform
 import queue
 import random
 import time
@@ -510,7 +511,9 @@ class tkapp:
         self.app.config(menu=self.menu)
 
         
-
+        self.menu.add_command(label='mv',command=self.mv_play)
+        self.menu.add_command(label='music',command=self.back_music)
+        self.screen = ttkbootstrap.Canvas(self.app)
 
         self.plugin_list = []
         self.run_play_list = []
@@ -554,7 +557,24 @@ class tkapp:
         for xnn in self.run_pause_list:xnn(self)
         self.player.pause()
     
-    
+    def mv_play(self):
+        self.dis_f.grid_remove()
+        self.player.del_listen(vlc.EventType.MediaPlayerEndReached)
+        self.screen.grid(row=0,column=0,sticky='nsew')
+        if platform.system() == "Windows":
+            self.hwnd = self.screen.winfo_id()
+            self.player.music_player.set_hwnd(self.hwnd)
+        elif platform.system() == "Linux":
+            self.player.music_player.set_xwindow(self.screen.winfo_id())
+        elif platform.system() == "Darwin":
+            self.player.music_player.set_nsobject(self.screen.winfo_id())
+        x = self.player.music_message.get('name','')
+        if x and self.music_dict.get(x).get('video') != 'no<>found':
+            self.player.set_media_path_mv(x,self.music_dict.get(x,'').get('video'))
+        
+    def back_music(self):
+        self.screen.grid_remove()
+        self.dis_f.grid()
     def flush_display(self):
         msg = self.player.music_message
         if self.player.music_photo:
