@@ -6,8 +6,6 @@ from threading import Thread
 import time
 import traceback,pystray
 
-import functools
-
 import mutagen.flac
 import mutagen.id3
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -49,45 +47,10 @@ class player:
         self.music_dict = d
 
         self.listb: "ttkbootstrap.Listbox | None" = None
-        self._listening = False
-        self._current_end_action = lambda: None
     def add_listen(self,event,func,*args):
         self.music_player.event_manager().event_attach(event,func,*args)
     def del_listen(self,event):
         self.music_player.event_manager().event_detach(event)
-
-    def _stop_listen(self):
-        """摘掉 EndReached 监听,并让已挂起的代际失效。
-
-        每次都先 detach 再挂,避免 libvlc 事件管理器里堆积回调。
-        不用裸 except:event_detach 对没挂过的回调在部分版本会抛错。
-        """
-        self._gen += 1
-        if not self._listening:
-            return
-        self._listening = False
-        try:
-            self.del_listen(vlc.EventType.MediaPlayerEndReached)
-        except Exception as e:
-            print(f'摘除 EndReached 监听失败(忽略):{e}')
-
-    def _listen(self, path, end_action):
-        self.add_listen(vlc.EventType.MediaPlayerEndReached,
-                        self.play_backbround_listen, path, end_action, self._gen)
-        self._listening = True
-
-    def _complete_media(self):
-        """同一首放完只切一次歌。
-
-        EndReached 经 _pump 在 Tk 主线程调到这里;若监听已被 stop() 摘掉
-        (_listening 为 False),说明用户已经跳过这首,不能再切。
-        自动切歌时复用当前曲目注册的回调,而不是传 None —— 否则
-        _after_switch 里 end_action() 会直接 TypeError。
-        """
-        if not self._listening:
-            return
-        self._stop_listen()
-        self._advance(None, self._current_end_action)
     def set_b(self,ml):self.ml = ml
     def set_d(self,d:dict,l:"ttkbootstrap.Listbox"):
         self.music_dict = d
@@ -245,17 +208,16 @@ class player:
         end_action()
 
     def set_media_path_mv(self,name,path):
+        
         if not path or path == NO_FILE:
-            ttkbootstrap.Messagebox.show_warning('未指定文件',parent=None)
+            ttkbootstrap.Messagebox.show_warning('未指定文件',path)
             return False
-        self._stop_listen()            # 先摘音乐监听,否则它会一直挂着并在切回音乐时误切歌
-        self._gen += 1
+        self._gen += 1                  
         self.music_player.set_mrl(path)
         mini = (self.music_dict.get(name) or {}).get('music',None)
         if mini:
             self.load_message(name,mini)
-        else:
-            self.music_photo = Image.open(os.path.join(BASE_DIR,'a.png'))
+        else:self.music_photo = Image.open(os.path.join(BASE_DIR,'a.png'))
         return True
 
 
@@ -264,11 +226,13 @@ class player:
         if not path or path == NO_FILE:
             ttkbootstrap.Messagebox.show_warning('未指定文件')
             return False
-        self._stop_listen()            # 先摘旧的,再挂新的 -> 监听始终只有一个
-        self._gen += 1
+            
         self.music_player.set_mrl(path)
-        self._listen(path,end_action)
-        self._current_end_action = end_action
+        
+        
+        
+        self._gen += 1
+        self.add_listen(vlc.EventType.MediaPlayerEndReached,self.play_backbround_listen,path,end_action,self._gen)
         self.load_message(name,path)
         return True
 
@@ -304,10 +268,9 @@ class player:
         self.listb.after(0,self.ml.config(text='暂停'))
         self.music_player.pause()
     def stop(self) -> None:
-        # 顺序很重要:先摘监听再 stop,否则 stop 期间可能触发一次
-        # EndReached 并把一条带有效 gen 的切歌请求塞进队列。
-        self._stop_listen()
         self.music_player.stop()
+        self._gen += 1                  
+        self.del_listen(vlc.EventType.MediaPlayerEndReached)
 
     def time_add_ten(self) -> None:
         if self.music_player.get_state() in (vlc.State.Playing,vlc.State.Paused):
@@ -511,12 +474,10 @@ class config:
         t = n.get('theme',self.DEFAULT['theme'])
         self.theme = t if isinstance(t,str) and t else self.DEFAULT['theme']
         try:
+
             self.exit_way = int(n.get('exit_way',self.DEFAULT['exit_way']))
         except (TypeError,ValueError):
             print(f'{self.path} 里的 exit_way 不是数字,按默认值处理')
-            self.exit_way = self.DEFAULT['exit_way']
-        if self.exit_way not in (0,1,2):
-            print(f'{self.path} 里的 exit_way={self.exit_way} 已失效,按默认值处理')
             self.exit_way = self.DEFAULT['exit_way']
 
     def save(self):
@@ -669,15 +630,12 @@ class tkapp:
                     n.init_i(self)
                     self.plugin_list.append(n)
 
-                    def _bind(fn, _app=self):
-                        return functools.partial(fn, _app)
-
                     if 'play' in n.exec_path:
-                        self.run_play_list.append(_bind(n.run))
+                        self.run_play_list.append(n.run)
                     if 'pause' in n.exec_path:
-                        self.run_pause_list.append(_bind(n.run))
+                        self.run_pause_list.append(n.run)
                     if 'listbox' in n.exec_path:
-                        self.run_listbox_list.append(_bind(n.run))
+                        self.run_listbox_list.append(n.run)
 
 
 
@@ -710,36 +668,21 @@ class tkapp:
             self.app.after(100,self._pump_ui)
         except tkinter.TclError:
             pass
-    _EXIT_DIRECT = 0
-    _EXIT_TRAY = 1
-    _EXIT_ASK = 2
-
-    def _show_exit_dialog(self) -> int:
-        """返回 _EXIT_DIRECT / _EXIT_TRAY / -1(取消)。
-
-        2.x 的 yesnocancel 返回按钮文本('直接退出'/'仅关闭窗口'/'取消')，
-        1.x 返回 True/False/None，两种都按文本优先处理，绝不拿返回值当字典键。
-        """
-        r = ttkbootstrap.Messagebox.yesnocancel(
-            '请选择退出方式：直接退出 / 仅关闭窗口 / 取消',
-            '退出',
-            parent=self.app,
-            buttons=['直接退出', '仅关闭窗口', '取消'],
-        )
-        if r == '直接退出' or r is True:
-            return self._EXIT_DIRECT
-        if r == '仅关闭窗口':
-            return self._EXIT_TRAY
-        return -1
-
     def on_closing(self):
-        way = self.config.exit_way
-        if way == self._EXIT_ASK:
-            way = self._show_exit_dialog()
-        if way == self._EXIT_DIRECT:
+        print(self.config.exit_way)
+        if self.config.exit_way == 0:
             self.exita()
-        elif way == self._EXIT_TRAY:
+        elif self.config.exit_way == 1:
             self.app.withdraw()
+        else :
+            n = {'直接退出':0,'仅关闭窗口':1,'取消':64}
+            a = ttkbootstrap.Messagebox.yesnocancel('退出',buttons=list(n.keys()))
+            if a:
+                print(n[a])
+                if n[a]== 0:
+                    self.exita()
+                elif n[a] == 1:
+                    self.app.withdraw()
 
 
     def setting(self):
@@ -750,7 +693,7 @@ class tkapp:
         
         ttkbootstrap.Radiobutton(a, text="直接退出", variable=v, value=0).pack(anchor="w")
         ttkbootstrap.Radiobutton(a, text="仅关闭窗口", variable=v, value=1).pack(anchor="w")
-        ttkbootstrap.Radiobutton(a, text="每次询问", variable=v, value=tkapp._EXIT_ASK).pack(anchor="w")
+        ttkbootstrap.Radiobutton(a, text="询问", variable=v, value=2).pack(anchor="w")
 
         
         
@@ -815,7 +758,7 @@ class tkapp:
         if self.player.music_photo:
             size = max(self.app.winfo_height() // 4, 32)
             self.lll = ImageTk.PhotoImage(self.player.music_photo.resize((size, size)))
-            self.music_image.config(image=self.lll)
+        self.music_image.config(image=self.lll)
 
         def tag_text(key):
             
@@ -852,7 +795,7 @@ class tkapp:
                 self._restore_selection()
                 return
 
-            aaa = ttkbootstrap.Messagebox.yesno('是否切换音乐','music player',parent=self.app,buttons=['是','否'])
+            aaa = ttkbootstrap.Messagebox.yesno('是否切换音乐','music player',buttons=['是','否'])
             if aaa == '是':
                 self.player.stop()
                 if self.player.set_media_path(a,file,self.flush_display):
@@ -873,7 +816,7 @@ class tkapp:
                 self._restore_selection()
                 return
             
-            aaa = ttkbootstrap.Messagebox.yesno('是否切换视频','music player',parent=self.app,buttons=['是','否'])
+            aaa = ttkbootstrap.Messagebox.yesno('是否切换视频','music player',buttons=['是','否'])
             if aaa == '是':
                 self.player.stop()
                 if self.player.set_media_path_mv(a,file):
@@ -902,8 +845,6 @@ class tkapp:
         
         
         self.index = None
-        self.player._gen += 1
-        self.player._stop_listen()
         self.dfl.selection_clear(0,tkinter.END)
 
 

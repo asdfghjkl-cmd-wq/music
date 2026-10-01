@@ -17,3 +17,8 @@ __pycache__/b.cpython-313.pyc
 _verify_fix3.py
 _verify_fix2.py
 _verify_fix.py
+b.py
+exit
+config.json
+plugin/
+tmp*
