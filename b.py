@@ -1,26 +1,19 @@
-import os
-import platform
-import queue
-import random
 from threading import Thread
-import time
-import traceback,pystray
-
-import functools
-
+import tkinter,io,time,random,queue,platform,os,functools,sys,copy
 import mutagen.flac
 import mutagen.id3
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.environ['PYTHON_VLC_MODULE_PATH'] = f"{BASE_DIR}/pvlc"
 from PIL import ImageTk,Image
-import ttkbootstrap,json,tkinter,vlc,mutagen,io
+import traceback,pystray,ttkbootstrap,json,vlc,mutagen
 
 
 
-NO_FILE = 'no<>found'
+
+NO_FILE = 'no<>found*.mp3*.mp4..'
 
 
-class player:
+class Player:
     def __init__(self,d:dict): 
         params = [
                         "--network-caching=3000",  
@@ -29,12 +22,15 @@ class player:
                         "--verbose=-1"
                     ]
         self.player= vlc.Instance(" ".join(params))
-        self.music_message = {}
+
         self.music_photo = None
 
         self.play_tt = 0
 
  
+        
+        
+        self.music_message = {'name': ''}
         self._pending: "queue.Queue" = queue.Queue()
         self._pumping = False
 
@@ -44,88 +40,87 @@ class player:
         self._bad: "set" = set()
  
         self._gen = 0
+        # 当前播放的是条目里的哪一路:'music' 或 'video'。
+        # 自动切歌按这个字段取路径,避免在 MV 模式下切到音频文件。
+        self.media_key = 'music'
         self.ml = None
         self.music_player = vlc.MediaPlayer(self.player)
         self.music_dict = d
 
         self.listb: "ttkbootstrap.Listbox | None" = None
         self._listening = False
-        self._current_end_action = lambda: None
     def add_listen(self,event,func,*args):
         self.music_player.event_manager().event_attach(event,func,*args)
     def del_listen(self,event):
         self.music_player.event_manager().event_detach(event)
-
+    def play_jump_not_stop(self):
+        # 拖动进度条之后,按"上次开始播放的时刻"算很容易被误判成短播
+        # (见 _advance 里的三次拉黑),这里用一个远早于任何 time.monotonic()
+        # 的值把计时起点顶开。
+        self._play_started = -64.0
     def _stop_listen(self):
-        """摘掉 EndReached 监听,并让已挂起的代际失效。
 
-        每次都先 detach 再挂,避免 libvlc 事件管理器里堆积回调。
-        不用裸 except:event_detach 对没挂过的回调在部分版本会抛错。
-        """
         self._gen += 1
         if not self._listening:
             return
         self._listening = False
-        try:
-            self.del_listen(vlc.EventType.MediaPlayerEndReached)
-        except Exception as e:
-            print(f'摘除 EndReached 监听失败(忽略):{e}')
+        for ev in (vlc.EventType.MediaPlayerEndReached,
+                   vlc.EventType.MediaPlayerEncounteredError):
+            try:
+                self.del_listen(ev)
+            except Exception as e:
+                print(f'摘除 {ev} 监听失败(忽略):{e}')
 
     def _listen(self, path, end_action):
+        # 正常放完(EndReached)和打不开/解不开(EncounteredError)都必须接管:
+        # 只接前者的话,遇到坏文件自动切歌会永久停在那里,不会跳到下一首。
         self.add_listen(vlc.EventType.MediaPlayerEndReached,
-                        self.play_backbround_listen, path, end_action, self._gen)
+                        self._on_end_reached, path, end_action, self._gen)
+        self.add_listen(vlc.EventType.MediaPlayerEncounteredError,
+                        self._on_encountered_error, path, end_action, self._gen)
         self._listening = True
 
-    def _complete_media(self):
-        """同一首放完只切一次歌。
 
-        EndReached 经 _pump 在 Tk 主线程调到这里;若监听已被 stop() 摘掉
-        (_listening 为 False),说明用户已经跳过这首,不能再切。
-        自动切歌时复用当前曲目注册的回调,而不是传 None —— 否则
-        _after_switch 里 end_action() 会直接 TypeError。
-        """
-        if not self._listening:
-            return
-        self._stop_listen()
-        self._advance(None, self._current_end_action)
-    def set_b(self,ml):self.ml = ml
-    def set_d(self,d:dict,l:"ttkbootstrap.Listbox"):
+    def set_dict_and_tk_obj(self,d:dict,l:"ttkbootstrap.Listbox",ml):
         self.music_dict = d
         self.listb = l
-
+        self.ml = ml
+        # 重扫之后已经不在列表里的曲目,没必要继续留在拉黑名单里
+        self._bad &= set(d.keys())
         if not self._pumping:
             self._pumping = True
             self._pump()
-    def set_a(self,aint):
+    def set_play_way(self,aint):
         
         if 0<=aint<=2:self.play_tt = aint
-    def play_backbround_listen(self,event,path,end_action,gen):
-        """
-        MediaPlayerEndReached 的回调,运行在 libvlc 的事件线程里。
-        libvlc 不可重入,而且这个回调【不在 Tk 主线程】—— 原来这里直接调
-        lb.after(...),那本身就是一次跨线程的 tkinter 调用,属于未定义行为。
-        现在只往线程安全队列里塞一条数据,真正的切歌交给主线程的 _pump()。
-        gen 是注册这次监听时的代际值,_pump() 用它丢弃已经过期的事件。
-        """
-        self._pending.put((path,end_action,gen))
+    def _on_end_reached(self,event,path,end_action,gen):
+        # VLC 在自己的线程里回调,这里只投队列,真正的切歌在 Tk 线程的 _pump 里做
+        self._pending.put((path,end_action,gen,False))
+
+    def _on_encountered_error(self,event,path,end_action,gen):
+        # "打不开/解不开"是确定性证据,标记 failed 让 _advance 直接拉黑这一首
+        self._pending.put((path,end_action,gen,True))
 
     def _pump(self):
-        """在主线程里排期,消费 vlc 事件线程投递过来的切歌请求。"""
+        
         lb = self.listb
         if lb is None:
+            # 列表控件还没准备好。这里必须放开 _pumping,否则 set_dict_and_tk_obj
+            # 之后再也不会启动轮询,队列里的事件就永远没人处理了。
+            self._pumping = False
             return
         try:
             while True:
-                path,end_action,gen = self._pending.get_nowait()
+                path,end_action,gen,failed = self._pending.get_nowait()
                 if gen != self._gen:
                     
                     
                     continue
-                self._advance(path,end_action)
+                self._advance(path,end_action,failed)
         except queue.Empty:
             pass
         try:
-            lb.after(50,self._pump)
+            lb.after(50,self._pump,)
         except tkinter.TclError:
             pass                      
 
@@ -137,38 +132,33 @@ class player:
         lb.selection_set(index)
         lb.see(index)
 
-    def _advance(self,path,end_action):
-        """真正切歌,由 _pump() 在 Tk 主线程里排期调用。"""
-        
-        
-        
-        
-        if time.monotonic() - self._play_started < 1.0:
+    def _advance(self,path,end_action,failed=False):
+        name = self.music_message.get('name') or ''
+        if failed:
+            # 打开/解码失败是确定性证据,不用等短播计数攒够三次,直接拉黑
+            if name and name not in self._bad:
+                self._bad.add(name)
+                print(f'{name} 打开或解码失败,已跳过并不再自动选择它')
+            self._short_plays = 0
+        elif time.monotonic() - self._play_started < 1.0:
             self._short_plays += 1
             if self._short_plays >= 3:
-                bad = self.music_message.get('name','')
-                if bad and bad not in self._bad:
-                    self._bad.add(bad)
-                    print(f'{bad} 连续 {self._short_plays} 次无法正常播放,自动切歌不再选它')
+                if name and name not in self._bad:
+                    self._bad.add(name)
+                    print(f'{name} 连续 {self._short_plays} 次无法正常播放,自动切歌不再选它')
         else:
             self._short_plays = 0
 
-        
-        
-        self.del_listen(vlc.EventType.MediaPlayerEndReached)
-
-
-
         match self.play_tt:
             case 0:       
-                name = self.music_message.get('name','')
                 if name in self._bad:
                     
                     
                     print(f'{name} 无法播放,单曲循环已停止,请换一首或检查文件')
+                    self._set_status('播放失败:文件无法播放')
                     self._gen += 1          
                     return
-                ok = self.set_media_path(name,path,end_action)
+                ok = self._replay(name,path,end_action)
                 self._after_switch(ok,path,end_action)
                 
             case 1:
@@ -185,17 +175,21 @@ class player:
                         
 
 
+    def _replay(self,name,path,end_action):
+        # 按当前模式重放指定的这一首:音频走 set_media_path,视频走 set_media_path_mv
+        if self.media_key == 'video':
+            return self.set_media_path_mv(name,path,end_action)
+        return self.set_media_path(name,path,end_action)
+
     def _playable(self,name):
-        """该条目可播放的文件路径,没有则返回空串。"""
+        
         if name in self._bad:
             return ''
-        p = (self.music_dict.get(name) or {}).get('music','')
+        p = self.music_dict.get(name,{}).get(self.media_key,'')
         return p if p and p != NO_FILE else ''
 
     def _next_seq(self):
-        """顺序播放的下一首:从当前这首往后绕一圈,跳过没文件或播不出来的条目。
-        原来只试一首,一旦那首缺文件,就把监听挂到了一个永远不会再响的 path 上
-        (那是【上一首】的路径),自动切歌从此静默失效。"""
+
         keys = list(self.music_dict.keys())
         if not keys:
             return None
@@ -203,13 +197,16 @@ class player:
         start = keys.index(n) if n in keys else -1
         for i in range(1,len(keys)+1):
             cand = keys[(start+i) % len(keys)]
+            if cand == n:
+                # 绕了整整一圈又回到自己:说明确实没有别的可播,
+                # 顺序播放不该把自己当成"下一首"反复重放。
+                continue
             if self._playable(cand):
                 return cand
         return None
 
     def _next_random(self):
-        """随机播放:只从能播的条目里抽,并排除当前这首 ——
-        否则会"随机到自己",表现为按了没反应。"""
+
         cand = [x for x in self.music_dict if self._playable(x)]
         n = self.music_message.get('name','')
         if len(cand) > 1 and n in cand:
@@ -217,15 +214,22 @@ class player:
         if not cand:
             return None
         return random.choice(cand)
-
+    def stop_listen(self):
+        self._stop_listen()
     def _advance_to(self,name,end_action):
-        """切到指定曲目。name 为 None 表示曲库里已经找不到可播的了。"""
+        
+        # _next_seq/_next_random 已经过滤过拉黑名单,这里再兜一次底:
+        # 任何情况下都不自动切到已知放不出来的曲目,否则会来回空转。
+        if name in self._bad:
+            print(f'{name} 已被标记为无法播放,忽略这次自动切歌')
+            name = None
         if name is None:
             print('没有可播放的下一首,自动切歌停止')
-            self._gen += 1              
+            self._set_status('无可播放的下一首')
+            self._gen += 1
             return
         path = self._playable(name)
-        ok = self.set_media_path(name,path,end_action)
+        ok = self._replay(name,path,end_action)
         if ok:
             keys = list(self.music_dict.keys())
             if name in keys:
@@ -233,52 +237,89 @@ class player:
         self._after_switch(ok,path,end_action)
     def set_volume(self,volume):
         self.music_player.audio_set_volume(volume)
+    def _set_status(self,text):
+        # 状态文字只有 Tk 线程能碰,保留 after(0) 是为了万一有插件从别的线程调用
+        w = self.listb if self.listb is not None else self.ml
+        if w is None:
+            return
+        def _apply():
+            ml = self.ml
+            if ml is None:
+                return
+            try:
+                ml.config(text=text)
+            except tkinter.TclError:
+                pass
+        try:
+            w.after(0,_apply)
+        except tkinter.TclError:
+            pass
+
+    def start_current(self):
+        # 播放已经 set_mrl 好的媒体,并把短播计时的起点重置到此刻。
+        # 给 _after_switch 和 Tkapp 用,外部就不必再去改 _play_started 了。
+        self.play()
+        self._play_started = time.monotonic()
+
     def _after_switch(self,ok,path,end_action):
         if not ok:
             
             
             
             print(f'切歌失败,自动播放已停止:{path!r}')
+            self._set_status('切歌失败')
             return
-        self.play()
-        self._play_started = time.monotonic()
-        end_action()
+        self.start_current()
+        if end_action is not None:
+            end_action()
 
-    def set_media_path_mv(self,name,path):
+    def set_media_path_mv(self,name,path,end_action=None):
         if not path or path == NO_FILE:
             ttkbootstrap.Messagebox.show_warning('未指定文件',parent=None)
             return False
-        self._stop_listen()            # 先摘音乐监听,否则它会一直挂着并在切回音乐时误切歌
+        self._stop_listen()            
         self._gen += 1
         self.music_player.set_mrl(path)
-        mini = (self.music_dict.get(name) or {}).get('music',None)
-        if mini:
-            self.load_message(name,mini)
-        else:
-            self.music_photo = Image.open(os.path.join(BASE_DIR,'a.png'))
+        # 标签/封面的来源显式给出:优先用同名音乐文件的标签;
+        # 没有可用的音乐文件时传 None(而不是把 NO_FILE 哨兵当路径去读标签),
+        # 由 load_message 统一负责重置信息与封面。
+        tag_path = self.music_dict.get(name,{}).get('music',None)
+        if not tag_path or tag_path == NO_FILE or not os.path.isfile(tag_path):
+            tag_path = None
+        self.media_key = 'video'
+        self.load_message(name,tag_path)
+        if end_action is not None:
+            self._listen(path,end_action)
         return True
 
 
-    def set_media_path(self,name,path,end_action):
-        """设置要播放的文件。返回 False 表示没有可播放的文件。"""
+    def set_media_path(self,name:str,path:str,end_action=None):
+        
         if not path or path == NO_FILE:
             ttkbootstrap.Messagebox.show_warning('未指定文件')
             return False
-        self._stop_listen()            # 先摘旧的,再挂新的 -> 监听始终只有一个
+        self._stop_listen()            
         self._gen += 1
         self.music_player.set_mrl(path)
-        self._listen(path,end_action)
-        self._current_end_action = end_action
+        self.media_key = 'music'
+        if end_action is not None:
+            self._listen(path,end_action)
         self.load_message(name,path)
         return True
 
-    def load_message(self,name,path):
+
+    def load_message(self,name:str,path:"str | None"):
         
         
         
         
         self.music_message = {'name': name}
+        if self.music_photo:
+            self.music_photo.close()
         self.music_photo = Image.open(os.path.join(BASE_DIR,'a.png'))
+        if not path or path == NO_FILE:
+            # 没有标签来源:只保留默认封面与空信息,不做无意义的标签读取
+            return
         try:
             a = mutagen.File(path,easy=True)
             if a is not None:                  
@@ -296,19 +337,22 @@ class player:
                 for pic in tags.getall("APIC"):
                     self.music_message['pic_mine'] = pic.mime
                     self.music_photo = Image.open(io.BytesIO(pic.data))
-        except Exception as w:print(w) 
+        except Exception:traceback.print_exc()
     def play(self) -> int:
-        self.listb.after(0,self.ml.config(text='播放'))
+        self._set_status('播放')
         return self.music_player.play()
     def pause(self) -> None:
-        self.listb.after(0,self.ml.config(text='暂停'))
+        self._set_status('暂停')
         self.music_player.pause()
     def stop(self) -> None:
-        # 顺序很重要:先摘监听再 stop,否则 stop 期间可能触发一次
-        # EndReached 并把一条带有效 gen 的切歌请求塞进队列。
+        self._set_status('无')
         self._stop_listen()
         self.music_player.stop()
-
+    def cleanup(self):
+        self._stop_listen()
+        self.music_player.stop()
+        self.music_player.release()
+        self.player.release()
     def time_add_ten(self) -> None:
         if self.music_player.get_state() in (vlc.State.Playing,vlc.State.Paused):
             t = self.music_player.get_time()+10000
@@ -319,32 +363,20 @@ class player:
             self.music_player.set_time(t)
     def time_minus_ten(self) -> None:
         if self.music_player.get_state() in (vlc.State.Playing,vlc.State.Paused):self.music_player.set_time(max(self.music_player.get_time()-10000,0))
-
-            
 def fmt_time(ms):
-    """毫秒 -> mm:ss（超过一小时用 h:mm:ss）"""
+    
     s = max(int(ms),0) // 1000
     h,s = divmod(s,3600)
     m,s = divmod(s,60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-
-
 class SeekBar(ttkbootstrap.Frame):
-    """
-    可拖动的播放进度条。
-    - 拖动中：只更新文字预览，不 seek，避免卡顿
-    - 松手后：执行 seek
-    - 非拖动时：定时轮询播放器位置自动刷新
-    刻度用 0~1000 归一化，避免 maximum 动态变化
-    """
-
     SCALE_MAX = 1000        
-
     def __init__(self, master, media_player: "vlc.MediaPlayer",
-                 interval: int = 500, **kw):
+                 interval: int = 500, owner=None, **kw):
         super().__init__(master, **kw)
         self.media_player = media_player
         self.interval = interval
+        self.owner = owner          
 
         self._dragging = False
         self._after_id = None
@@ -386,6 +418,9 @@ class SeekBar(ttkbootstrap.Frame):
         if self._total > 0:
             ratio = self.scale.get() / self.SCALE_MAX
             self.media_player.set_time(int(self._total * ratio))
+            
+            
+            self.owner.play_jump_not_stop()
 
     def _on_scale_move(self, value):
         
@@ -402,34 +437,45 @@ class SeekBar(ttkbootstrap.Frame):
     def _poll(self):
         if self._destroyed:
             return
+        try:
+            self._tick()
+        except tkinter.TclError:
+            
+            self._destroyed = True
+            self._after_id = None
+            return
+        try:
+            self._after_id = self.after(self.interval, self._poll)
+        except tkinter.TclError:
+            self._destroyed = True
+            self._after_id = None
+
+    def _tick(self):
         mp = self.media_player
-        if not self._dragging:
-            self._total = mp.get_length() or 0
-            cur = mp.get_time() or 0
+        if self._dragging:
+            return
+        self._total = mp.get_length() or 0
+        cur = mp.get_time() or 0
 
-            if self._total > 0:
-                if not self.scale.instate(['disabled']):          
-                    self.scale.set(cur / self._total * self.SCALE_MAX)
-                self.label.config(
-                    text=f"{fmt_time(cur)} / {fmt_time(self._total)}")
-            else:
-                self.label.config(text="00:00 / 00:00")
-
-        self._after_id = self.after(self.interval, self._poll)
+        if self._total > 0:
+            self.scale.set(cur / self._total * self.SCALE_MAX)
+            self.label.config(text=f"{fmt_time(cur)} / {fmt_time(self._total)}")
+        else:
+            self.label.config(text="00:00 / 00:00")
 
 
-class plugin:
-    def __init__(self,dir):
+class Plugin:
+    def __init__(self,dir:str):
 
-        cfg = os.path.join(dir,'plugin.json')
+        self.plugin_file_path = os.path.join(dir,'plugin.json')
         n = {}
         try:
-            with open(cfg,'r',encoding='utf-8') as fp:
+            with open(self.plugin_file_path,'r',encoding='utf-8') as fp:
                 n = json.load(fp)
         except Exception as e:
-            print(f'读取 {cfg} 失败,按空配置处理:{e}')
+            print(f'读取 {self.plugin_file_path} 失败,按空配置处理:{e}')
         if not isinstance(n,dict):
-            print(f'{cfg} 的内容不是 JSON 对象,按空配置处理')
+            print(f'{self.plugin_file_path} 的内容不是 JSON 对象,按空配置处理')
             n = {}
         
         self.init = n.get('init','').replace('from b import *','',1)
@@ -460,37 +506,69 @@ class plugin:
         
         
         
-        self.kk = dict(globals())
+        self.env_dict = dict(globals())
 
         
     def init_i(self,tkaapp):
-        self.kk['pro'] = tkaapp
+        self.env_dict['pro'] = tkaapp
         
-        if self.can_exec and not self.init_ok:tkaapp.app.after(0,lambda:exec(compile(self.init,"<string>","exec"),self.kk));self.init_ok=True
+        if not self.can_exec or self.init_ok:
+            return
+        self.init_ok = True
+        try:
+            # 先编译:语法错误在这里就能拿到,不用等回调里再炸
+            code = compile(self.init,f'<plugin {self.name} init>','exec')
+        except Exception as e:
+            print(f'插件 {self.name} 的 init 代码无法编译,已跳过:{e}')
+            return
+        def _run_init():
+            # 插件代码出问题只应该影响它自己,不能把整个播放器带崩
+            try:
+                exec(code,self.env_dict)
+            except Exception as e:
+                print(f'插件 {self.name} 初始化失败:{e}')
+                traceback.print_exc()
+        tkaapp.app.after(0,_run_init)
 
 
     def run(self,tkaapp=None):
-        self.kk['pro'] = tkaapp
-        if not self.can_exec:
+        if not self.can_exec or tkaapp is None:
             return
+        self.env_dict['pro'] = tkaapp
         if not self.com:
-            self.com = compile(self.command,"<string>","exec")
+            try:
+                self.com = compile(self.command,f'<plugin {self.name} command>','exec')
+            except Exception as e:
+                print(f'插件 {self.name} 的 command 无法编译,已跳过:{e}')
+                return
         
         
         
-        tkaapp.app.after(0,lambda:exec(self.com,self.kk))
+        def _run_command():
+            try:
+                exec(self.com,self.env_dict)
+            except Exception as e:
+                print(f'插件 {self.name} 执行失败:{e}')
+                traceback.print_exc()
+        tkaapp.app.after(0,_run_command)
 
 
 
-class config:
+class Config:
 
-    DEFAULT = {'theme': 'solarized-light', 'exit_way': 0}
+    DEFAULT = {'theme': 'solarized-light', 'exit_way': 0,'allow_plugin':[]}
+
+    @classmethod
+    def _default(cls,key):
+        """取默认值的副本,避免 DEFAULT 里的可变对象(如白名单列表)被泄漏出去后就地改写"""
+        return copy.deepcopy(cls.DEFAULT[key])
 
     def __init__(self):
         self.path = os.path.join(BASE_DIR,'config.json')
-        self._dict = dict(self.DEFAULT)
-        self.theme = self.DEFAULT['theme']
-        self.exit_way = self.DEFAULT['exit_way']
+        self._dict = copy.deepcopy(self.DEFAULT)
+        self.theme = self._default('theme')
+        self.exit_way = self._default('exit_way')
+        self.allow_plugin = self._default('allow_plugin')
         self.load()
 
     def load(self):
@@ -508,20 +586,44 @@ class config:
             n = {}
         self._dict = n
 
-        t = n.get('theme',self.DEFAULT['theme'])
-        self.theme = t if isinstance(t,str) and t else self.DEFAULT['theme']
+        t = n.get('theme',None)
+        p = n.get('allow_plugin',None)
+        if p is None:
+            # 兼容历史配置里的旧键名,避免用户的白名单被静默清空
+            for legacy in ('plugin','sussess_plugin','success_plugin'):
+                if legacy in n:
+                    print(f'{self.path} 使用了旧键 {legacy},已按 allow_plugin 处理')
+                    p = n[legacy]
+                    break
+        self.theme = t if isinstance(t,str) and t else self._default('theme')
+
+        if isinstance(p,list):
+            bad = [x for x in p if not (isinstance(x,str) and x)]
+            if bad:
+                print(f'{self.path} 里的 allow_plugin 有 {len(bad)} 个无效项,已忽略:{bad!r}')
+            # 空列表是合法值:表示不自动加载任何插件
+            self.allow_plugin = [x for x in p if isinstance(x,str) and x]
+        else:
+            if p is not None:
+                print(f'{self.path} 里的 allow_plugin 不是数组,按默认值处理')
+            self.allow_plugin = self._default('allow_plugin')
+
         try:
-            self.exit_way = int(n.get('exit_way',self.DEFAULT['exit_way']))
+            self.exit_way = int(n.get('exit_way',self._default('exit_way')))
         except (TypeError,ValueError):
             print(f'{self.path} 里的 exit_way 不是数字,按默认值处理')
-            self.exit_way = self.DEFAULT['exit_way']
+            self.exit_way = self._default('exit_way')
         if self.exit_way not in (0,1,2):
             print(f'{self.path} 里的 exit_way={self.exit_way} 已失效,按默认值处理')
-            self.exit_way = self.DEFAULT['exit_way']
+            self.exit_way = self._default('exit_way')
 
     def save(self):
+        # 清掉已经迁移过的旧键,免得它们一直留在配置文件里
+        for legacy in ('plugin','sussess_plugin','success_plugin'):
+            self._dict.pop(legacy,None)
         self._dict['theme'] = self.theme
         self._dict['exit_way'] = self.exit_way
+        self._dict['allow_plugin'] = self.allow_plugin
 
         tmp = self.path + '.tmp'
         try:
@@ -533,13 +635,25 @@ class config:
 
 
 
-class tkapp:
+class Tkapp:
     def __init__(self):
+        
+        self.theme_var = None
+        self.hwnd = None
+        # <Configure> 去抖用的 after id,以及封面 PhotoImage 的缓存键
+        # (避免窗口里任何一点尺寸变化都重建一次封面图)
+        self._resize_after = None
+        self._cover_src = None
+        self._cover_size = -1
         self.music_dict = {}
-        self.player = player(self.music_dict)
+        self.player = Player(self.music_dict)
         self.index: "int | None" = None     
         self.app= ttkbootstrap.Tk('music')   
 
+        # 这里原先有一段"Python < 3.10 就提示升级"的检查,但本文件用了 match 语句,
+        # 低版本解释器在解析阶段就会 SyntaxError,那段代码永远执行不到,故删除。
+        # 结论:本程序需要 Python >= 3.10,只能由启动方式/文档来保证。
+        self.app.bind_class('Button',"<space>",self.play_stop)
         self.app.protocol('WM_DELETE_WINDOW',self.on_closing)
         self.app.title('music')
         self.app.geometry("800x600+20+200")
@@ -548,93 +662,105 @@ class tkapp:
         self.app.rowconfigure(2, weight=10)
         self.app.columnconfigure(0, weight=3)
         self.app.columnconfigure(1, weight=1)
+        self.config = Config()
 
-        self.config = config()
-
-        self.a = ttkbootstrap.Style()
-        names = self.a.theme_names()
+        self.style = ttkbootstrap.Style()
+        names = self.style.theme_names()
         theme = self.config.theme if self.config.theme in names else 'solarized-light'
         if theme in names:
-            self.a.theme_use(theme)
+            self.style.theme_use(theme)
         else:
             print(f'没有可用的主题:{theme}')
-        self.ma  = Image.open(os.path.join(BASE_DIR,'a.png'))
+        self.raw_image_obj  = Image.open(os.path.join(BASE_DIR,'a.png'))
         
-        self._icon_image = ImageTk.PhotoImage(self.ma.resize((16,16)))
-        self.app.iconphoto(True,self._icon_image)
-        
+        self._tk_image_obj = ImageTk.PhotoImage(self.raw_image_obj.resize((16,16)))
+        self.app.iconphoto(True,self._tk_image_obj)
+
         
         
         self._ui_queue: "queue.Queue" = queue.Queue()
-        self.icon_menu =  pystray.Menu(pystray.MenuItem('显示主界面',lambda:self._ui_queue.put('show')),
+        self.icon_menu =  pystray.Menu(pystray.MenuItem('显示主界面',lambda:self._ui_queue.put('show'),default=True),
                                        pystray.MenuItem('退出',lambda:self._ui_queue.put('quit'))
                                        )
-        self.backround_icon = pystray.Icon('music',self.ma,'music player',self.icon_menu)
+        self.backround_icon = pystray.Icon('music',self.raw_image_obj,'music player',self.icon_menu)
         self.music_player_icon = Thread(target=self.backround_icon.run,daemon=True)
         self.music_player_icon.start()
         self._pump_ui()
 
-        self.dis_f = ttkbootstrap.Frame(self.app)
-        self.dis_f.grid(row=0,column=0,sticky='nsew')
+        
+        self.information_frame = ttkbootstrap.Frame(self.app)
+        self.information_frame.grid(row=0,column=0,sticky='nsew')
+        
+        self.Control_frame = ttkbootstrap.Frame(self.app)
+        self.Control_frame.grid(row=0,column=1)
 
-        self.con_f = ttkbootstrap.Frame(self.app)
-        self.con_f.grid(row=0,column=1)
+        self.volume_var = tkinter.IntVar(value=100)
+        self.music_label = ttkbootstrap.Label(self.Control_frame,text='音量:100')
+        self.music_volume = ttkbootstrap.Scale(self.Control_frame,from_=0,to=100,value=100,variable=self.volume_var,command=self.set_volume)
 
-        self.mvv = tkinter.IntVar(value=100)
-        self.music_label = ttkbootstrap.Label(self.con_f,text='音量:100')
-        self.music_volume = ttkbootstrap.Scale(self.con_f,from_=0,to=100,value=100,variable=self.mvv,command=self.vpu)
-        self.music_volume.bind()
         self.music_label.pack()
         self.music_volume.pack()
-        self.play_status_label = ttkbootstrap.Label(self.con_f,text="无")
+        self.play_status_label = ttkbootstrap.Label(self.Control_frame,text="无")
         self.play_status_label.pack()
-        self.player.set_b(self.play_status_label)
-        self.play_button = ttkbootstrap.Button(self.con_f,text='播放',command=self.play)
-        self.pause_button = ttkbootstrap.Button(self.con_f,text='暂停',command=self.pause)
+
+        self.play_button = ttkbootstrap.Button(self.Control_frame,text='播放',command=self.play)
+        self.pause_button = ttkbootstrap.Button(self.Control_frame,text='暂停',command=self.pause)
         self.play_button.pack(side='top')
         self.pause_button.pack(side='top')
-        self.cpls = tkinter.StringVar(value='单曲循环')
-        self.cpl = ttkbootstrap.Combobox(self.con_f,height=3,width=10,values=['单曲循环','顺序播放','随机播放'],textvariable=self.cpls,state='readonly')
-        self.cpl.pack(side='bottom')
-        self.cpl.bind("<<ComboboxSelected>>",self.change_mode)
+        self.player_mode_var = tkinter.StringVar(value='单曲循环')
+        self.music_mode_combobox_obj = ttkbootstrap.Combobox(self.Control_frame,height=3,width=10,values=['单曲循环','顺序播放','随机播放'],textvariable=self.player_mode_var,state='readonly')
+        self.music_mode_combobox_obj.pack(side='bottom')
+        self.music_mode_combobox_obj.bind("<<ComboboxSelected>>",self.change_mode)
 
-        self.c_f = ttkbootstrap.Frame(self.app)
-        self.c_f.grid(row=1,column=0,columnspan=2,sticky='ew',padx=8,pady=4)
-        self.c_f.columnconfigure([0,2],weight=1)
-        self.c_f.columnconfigure(1,weight=10)
+        self.Progress_bar = ttkbootstrap.Frame(self.app)
+        self.Progress_bar.grid(row=1,column=0,columnspan=2,sticky='ew',padx=8,pady=4)
+        self.Progress_bar.columnconfigure([0,2],weight=1)
+        self.Progress_bar.columnconfigure(1,weight=10)
 
-        self.seek = SeekBar(self.c_f,self.player.music_player)
+        self.seek = SeekBar(self.Progress_bar,self.player.music_player,owner=self.player)
         self.seek.grid(row=0,column=1,sticky='ew')
-        self.atb = ttkbootstrap.Button(self.c_f,text='⏪',command=self.player.time_minus_ten)
-        self.atb.grid(row=0,column=0)
-        self.mtb = ttkbootstrap.Button(self.c_f,text='⏩️',command=self.player.time_add_ten)
-        self.mtb.grid(row=0,column=2)
+        self.music_minus_ten_button = ttkbootstrap.Button(self.Progress_bar,text='⏪',command=self.player.time_minus_ten)
+        self.music_minus_ten_button.grid(row=0,column=0)
+        self.music_add_ten_button = ttkbootstrap.Button(self.Progress_bar,text='⏩️',command=self.player.time_add_ten)
+        self.music_add_ten_button.grid(row=0,column=2)
 
-        self.dis_f.rowconfigure([0,1],weight=1)
-        self.dis_f.columnconfigure([0,1],weight=1)
+        self.information_frame.rowconfigure([0,1],weight=1)
+        self.information_frame.columnconfigure([0,1],weight=1)
 
         ph = ImageTk.PhotoImage(Image.open(os.path.join(BASE_DIR,'a.png')).resize((int(600/4),int(600/4))))
-        self.music_image = ttkbootstrap.Label(self.dis_f,image=ph)
-        self.lll = ph
-        self.music_name = ttkbootstrap.Label(self.dis_f)
-        self.music_maker_name = ttkbootstrap.Label(self.dis_f)
+        self.music_image = ttkbootstrap.Label(self.information_frame,image=ph)
+        self.music_keep_not_clean = ph
+        self.music_name = ttkbootstrap.Label(self.information_frame)
+        self.music_maker_name = ttkbootstrap.Label(self.information_frame)
 
         self.music_image.grid(row=0,column=0,rowspan=2,sticky='nsew')
         self.music_name.grid(row=0,column=1,sticky='nsew')
         self.music_maker_name.grid(row=1,column=1,sticky='nsew')
 
-        self.df = ttkbootstrap.Frame(self.app)
-        self.df.rowconfigure(0,weight=1)
-        self.df.columnconfigure(0,weight=40)
-        self.df.columnconfigure(1,weight=1)
-        self.df.grid(row=2,column=0,columnspan=2,sticky='nsew')
-
-        self.scrollbar = ttkbootstrap.Scrollbar(self.df)
-        self.dfl = ttkbootstrap.Listbox(self.df,selectmode=tkinter.SINGLE,exportselection=False,yscrollcommand=self.scrollbar.set)
-        self.scrollbar.config(command=self.dfl.yview)
-        self.dfl.grid(row=0,column=0,sticky='nsew')
-
+        self.down_frame = ttkbootstrap.Frame(self.app)
+        self.down_frame.rowconfigure(0,weight=1)
+        self.down_frame.columnconfigure(0,weight=40)
+        self.down_frame.columnconfigure(1,weight=1)
+        self.down_frame.grid(row=2,column=0,columnspan=2,sticky='nsew')
+        
+        self.scrollbar = ttkbootstrap.Scrollbar(self.down_frame)
+        self.down_frame_listbox = ttkbootstrap.Listbox(self.down_frame,selectmode=tkinter.SINGLE,exportselection=False,yscrollcommand=self.scrollbar.set)
+        self.scrollbar.config(command=self.down_frame_listbox.yview)
+        self.down_frame_listbox.grid(row=0,column=0,sticky='nsew')
+        self.app.bind(sequence="<space>",func=self.play_stop)
+        self.down_frame_listbox.bind(sequence="<space>",func=self.play_stop)
         self.menu = ttkbootstrap.Menu(self.app)
+
+
+        
+        self.music_mode_combobox_obj.bind('<Down>',self.volume_down)
+        self.app.bind('<Down>',self.volume_down)
+        self.app.bind('<Up>',self.volume_up)
+        self.app.bind('<Left>',self.time_minus_ten)
+        self.app.bind('<Right>',self.time_add_ten)
+        self.app.bind("<Configure>", self.on_resize)
+        
+
 
         self.menu.add_command(label='重加载音乐列表',command=self.flush_music)
 
@@ -655,52 +781,128 @@ class tkapp:
         self.run_pause_list = []
         self.run_listbox_list = []
 
-        
+        def load_p(n:Plugin):
+            n.init_i(self)
+            self.plugin_list.append(n)
+            
+            def _bind(fn, _app=self):
+                return functools.partial(fn, _app)
+            
+            if 'play' in n.exec_path:
+                self.run_play_list.append(_bind(n.run))
+            if 'pause' in n.exec_path:
+                self.run_pause_list.append(_bind(n.run))
+            if 'listbox' in n.exec_path:
+                self.run_listbox_list.append(_bind(n.run))
         self.scrollbar.grid(row=0,column=1,sticky='n')
-        self.dfl.bind('<<ListboxSelect>>', self.change_music)
+        self.down_frame_listbox.bind('<<ListboxSelect>>', self.change_music)
         if os.path.exists(os.path.join(BASE_DIR,'plugin')) and os.path.isdir(os.path.join(BASE_DIR,'plugin')):
             for asa in os.listdir(os.path.join(BASE_DIR,'plugin')):
                 mn = os.path.join(BASE_DIR,'plugin',asa)
                 if not os.path.isdir(mn):continue
                 if not os.path.isfile(os.path.join(mn,'plugin.json')):continue
-                n = plugin(mn)
-                if ttkbootstrap.Messagebox.yesno(f'是否加载{n.name}',buttons=['是','否']) == '是':
-
-                    n.init_i(self)
-                    self.plugin_list.append(n)
-
-                    def _bind(fn, _app=self):
-                        return functools.partial(fn, _app)
-
-                    if 'play' in n.exec_path:
-                        self.run_play_list.append(_bind(n.run))
-                    if 'pause' in n.exec_path:
-                        self.run_pause_list.append(_bind(n.run))
-                    if 'listbox' in n.exec_path:
-                        self.run_listbox_list.append(_bind(n.run))
-
-
+                n = Plugin(mn)
+                try:
+                    if n.name in self.config.allow_plugin:
+                        load_p(n)
+                    else:
+                        if ttkbootstrap.Messagebox.yesno(f'是否加载{n.name}',title='插件',
+                                                         parent=self.app,buttons=['是','否']) == '是':
+                            if ttkbootstrap.Messagebox.yesno('是否默认加载',title='插件',
+                                                             parent=self.app,buttons=['是','否']) == '是':
+                                self.config.allow_plugin.append(n.name)
+                            load_p(n)
+                except Exception as e:
+                    # 单个插件出问题不该把整个播放器带崩
+                    print(f'加载插件 {n.name} 失败,已跳过:{e}')
+                    traceback.print_exc()
 
 
+
+        self.config.save()
         music_dir = os.path.join(BASE_DIR,'music')
         if not os.path.isdir(music_dir):
             
             os.makedirs(music_dir,exist_ok=True)
         self.flush_music()
-    def exita(self):self.app.destroy();self.backround_icon.stop()
-    def _pump_ui(self):
-        """在主线程消费托盘菜单投递过来的请求。
+    def on_resize(self,event):
+        # 注意:子控件的 <Configure> 也会冒到 toplevel 的 bindtags 上,
+        # 不判断 event.widget 的话,标签文字变一下就会触发一次封面缩放。
+        if event.widget is not self.app:
+            return
+        if self._resize_after is not None:
+            try:
+                self.app.after_cancel(self._resize_after)
+            except tkinter.TclError:
+                pass
+        self._resize_after = self.app.after(120,self._do_resize)
 
-        pystray 的菜单回调不在 Tk 线程里,直接操作控件(或者调 after)都属于未定义行为;
-        所以那边只 put 一个标记,真正的 deiconify/exita 在这里执行。
-        """
+    def _do_resize(self):
+        self._resize_after = None
+        self.flush_display()
+
+    def _select_name(self,name):
+        # 让列表高亮当前正在播放的条目
+        # (程序化 selection_set 不会触发 <<ListboxSelect>>,所以不会弹确认框)
+        keys = list(self.music_dict.keys())
+        if name not in keys:
+            self.index = None
+            return
+        self.index = keys.index(name)
+        self.down_frame_listbox.selection_clear(0,tkinter.END)
+        self.down_frame_listbox.selection_set(self.index)
+        self.down_frame_listbox.see(self.index)
+    def cleanup_and_exit(self):
+        self.app.destroy()
+        self.backround_icon.stop()
+        self.player.cleanup()
+        sys.exit(0)
+
+    def play_stop(self,e):
+        n = self.player.music_player.get_state()
+        if n == vlc.State.Playing:
+            self.pause()
+        elif n == vlc.State.Paused:
+            self.play()
+        return 'break'
+        
+    def _nav_focus(self):
+        # 焦点在列表框/下拉框里时,方向键应该留给控件自己用。
+        # toplevel 的绑定排在控件的类绑定之后照样会执行,所以必须自己挡一下,
+        # 否则在列表里按上下键会同时改音量、按左右键会同时快进/快退。
+        try:
+            w = self.app.focus_get()
+        except (KeyError,tkinter.TclError):
+            return False
+        return w is self.down_frame_listbox or w is self.music_mode_combobox_obj
+
+    def volume_down(self,e):
+        if self._nav_focus():
+            return None
+        n = self.volume_var.get()
+        if n-10<=0:self.volume_var.set(0);self.music_label.config(text=f"音量:0")
+        else:self.volume_var.set(n-10);self.music_label.config(text=f"音量:{n-10}")
+
+        return 'break'
+
+    def volume_up(self,e):
+        if self._nav_focus():
+            return None
+        n = self.volume_var.get()
+        if n+10>=100:self.volume_var.set(100);self.music_label.config(text=f"音量:100")
+        else:self.volume_var.set(n+10);self.music_label.config(text=f"音量:{n+10}")
+
+        return 'break'
+
+    def _pump_ui(self):
+
         try:
             while True:
                 cmd = self._ui_queue.get_nowait()
                 if cmd == 'show':
                     self.app.deiconify()
                 elif cmd == 'quit':
-                    self.exita()
+                    self.cleanup_and_exit()
                     return              
         except queue.Empty:
             pass
@@ -714,12 +916,18 @@ class tkapp:
     _EXIT_TRAY = 1
     _EXIT_ASK = 2
 
+    def time_add_ten(self,event):
+        if self._nav_focus():
+            return None
+        self.player.time_add_ten()
+        return 'break'
+    def time_minus_ten(self,event):
+        if self._nav_focus():
+            return None
+        self.player.time_minus_ten()
+        return 'break'
     def _show_exit_dialog(self) -> int:
-        """返回 _EXIT_DIRECT / _EXIT_TRAY / -1(取消)。
 
-        2.x 的 yesnocancel 返回按钮文本('直接退出'/'仅关闭窗口'/'取消')，
-        1.x 返回 True/False/None，两种都按文本优先处理，绝不拿返回值当字典键。
-        """
         r = ttkbootstrap.Messagebox.yesnocancel(
             '请选择退出方式：直接退出 / 仅关闭窗口 / 取消',
             '退出',
@@ -737,7 +945,7 @@ class tkapp:
         if way == self._EXIT_ASK:
             way = self._show_exit_dialog()
         if way == self._EXIT_DIRECT:
-            self.exita()
+            self.cleanup_and_exit()
         elif way == self._EXIT_TRAY:
             self.app.withdraw()
 
@@ -746,51 +954,36 @@ class tkapp:
         a = ttkbootstrap.Toplevel('setting',size=(250,250))
         v = tkinter.IntVar()
         v.set(self.config.exit_way)
-
-        
         ttkbootstrap.Radiobutton(a, text="直接退出", variable=v, value=0).pack(anchor="w")
         ttkbootstrap.Radiobutton(a, text="仅关闭窗口", variable=v, value=1).pack(anchor="w")
-        ttkbootstrap.Radiobutton(a, text="每次询问", variable=v, value=tkapp._EXIT_ASK).pack(anchor="w")
-
-        
-        
-        
-        
-        
-        self.theme_var: tkinter.StringVar = tkinter.StringVar(value=self.a.theme_use())
-
-        na = ttkbootstrap.Combobox(a,textvariable=self.theme_var,values=self.a.theme_names(),state='readonly')
-
-        print(na.get())
+        ttkbootstrap.Radiobutton(a, text="每次询问", variable=v, value=Tkapp._EXIT_ASK).pack(anchor="w")
+        self.theme_var: tkinter.StringVar = tkinter.StringVar(value=self.style.theme_use())
+        na = ttkbootstrap.Combobox(a,textvariable=self.theme_var,values=self.style.theme_names(),state='readonly')
         na.pack(anchor='w')
-        
-
-        
-
         def save():
             self.config.exit_way = v.get()
             self.config.theme = na.get()
-            self.a.theme_use(self.config.theme)
+            self.style.theme_use(self.config.theme)
             self.config.save()
             a.destroy()
         ttkbootstrap.Button(a,text='保存',command=save).pack()
 
-    def vpu(self,a):
+    def set_volume(self,a):
         b = round(float(a))
         self.music_label.config(text=f"音量:{b}")
         self.player.set_volume(b)
     def play(self):
-        for xnn in self.run_play_list:xnn(self)
+        for xnn in self.run_play_list:xnn()
         
         self.player.play()
     def pause(self):
-        for xnn in self.run_pause_list:xnn(self)
+        for xnn in self.run_pause_list:xnn()
         self.player.pause()
 
     def mv_play(self):
         self.music_mode = False
-        self.dis_f.grid_remove()
-        self.player.del_listen(vlc.EventType.MediaPlayerEndReached)
+        self.information_frame.grid_remove()
+        self.player.stop_listen()
         self.screen.grid(row=0,column=0,sticky='nsew')
         if platform.system() == "Windows":
             self.hwnd = self.screen.winfo_id()
@@ -798,24 +991,41 @@ class tkapp:
         elif platform.system() == "Linux":
             self.player.music_player.set_xwindow(self.screen.winfo_id())
         elif platform.system() == "Darwin":
+            # 未在 macOS 上验证:python-vlc 这里要的是 NSView*,Tk 的 window id 未必能用
             self.player.music_player.set_nsobject(self.screen.winfo_id())
         x = self.player.music_message.get('name','')
-        if x and self.music_dict.get(x).get('video') != NO_FILE:
-            self.player.set_media_path_mv(x,self.music_dict.get(x,{}).get('video'))
+        video = (self.music_dict.get(x) or {}).get('video',NO_FILE)
+        self.player.stop()
+        
+        if x and video != NO_FILE:
+            # 与音频模式保持一致:选中当前条目,设置好媒体之后立刻开始播放
+            if self.player.set_media_path_mv(x,video,self.flush_display):
+                self._select_name(x)
+                self.player.start_current()
         
     def back_music(self):
         self.music_mode = True
         self.screen.grid_remove()
-        self.dis_f.grid()
+        self.information_frame.grid()
         x = self.player.music_message.get('name','')
-        if x and self.music_dict.get(x).get('music') != NO_FILE:
-            self.player.set_media_path(x,self.music_dict.get(x,{}).get('music'),self.flush_display)
+        self.player.stop()
+        music = (self.music_dict.get(x) or {}).get('music',NO_FILE)
+        if x and music != NO_FILE:
+            # 从 MV 切回音频:同样选中条目并直接播放
+            if self.player.set_media_path(x,music,self.flush_display):
+                self._select_name(x)
+                self.player.start_current()
     def flush_display(self):
         msg = self.player.music_message
-        if self.player.music_photo:
+        src = self.player.music_photo
+        if src is not None:
             size = max(self.app.winfo_height() // 4, 32)
-            self.lll = ImageTk.PhotoImage(self.player.music_photo.resize((size, size)))
-            self.music_image.config(image=self.lll)
+            # 只有封面换了或者目标尺寸变了才重建 PhotoImage:
+            # 这个方法会被切歌回调和 <Configure> 频繁触发,重建一次的代价不小。
+            if src is not self._cover_src or size != self._cover_size:
+                self._cover_src,self._cover_size = src,size
+                self.music_keep_not_clean = ImageTk.PhotoImage(src.resize((size, size)))
+                self.music_image.config(image=self.music_keep_not_clean)
 
         def tag_text(key):
             
@@ -829,20 +1039,20 @@ class tkapp:
         self.music_maker_name.config(text=f'作者:{tag_text("artist")}')
 
     def change_mode(self,event):
-        a = self.cpls.get()
+        a = self.player_mode_var.get()
         match a:
-            case '单曲循环':self.player.set_a(0)
-            case '顺序播放':self.player.set_a(1)
-            case '随机播放':self.player.set_a(2)
+            case '单曲循环':self.player.set_play_way(0)
+            case '顺序播放':self.player.set_play_way(1)
+            case '随机播放':self.player.set_play_way(2)
             case _:print(f'未知播放模式:{a}')
 
 
     def change_music(self,event):
-        for xnn in self.run_listbox_list:xnn(self)
-        sel = self.dfl.curselection()
+        for xnn in self.run_listbox_list:xnn()
+        sel = self.down_frame_listbox.curselection()
         if not sel:return      
         idx = int(sel[0])
-        a = self.dfl.get(idx)
+        a = self.down_frame_listbox.get(idx)
         if self.music_mode:
             file = self.music_dict.get(a,{}).get("music",NO_FILE)
 
@@ -857,7 +1067,7 @@ class tkapp:
                 self.player.stop()
                 if self.player.set_media_path(a,file,self.flush_display):
                     self.index = idx
-                    self.player.play()   
+                    self.player.start_current()
                     self.flush_display()
                 else:
                     
@@ -865,7 +1075,7 @@ class tkapp:
             else:
                 self._restore_selection()
         else:
-            file = (self.music_dict.get(a) or {}).get("video",NO_FILE)
+            file = self.music_dict.get(a,{}).get("video",NO_FILE)
             
             
             if not file or file == NO_FILE:
@@ -876,41 +1086,41 @@ class tkapp:
             aaa = ttkbootstrap.Messagebox.yesno('是否切换视频','music player',parent=self.app,buttons=['是','否'])
             if aaa == '是':
                 self.player.stop()
-                if self.player.set_media_path_mv(a,file):
+                if self.player.set_media_path_mv(a,file,self.flush_display):
                     self.index = idx
-                    self.player.play()   
+                    self.player.start_current()
 
                 else:
                     
                     self._restore_selection()
             else:
                 self._restore_selection()
-
+        self.down_frame_listbox.focus_set()
     def _restore_selection(self):
-        self.dfl.selection_clear(0, tkinter.END)
-        if self.index is not None and 0 <= self.index < self.dfl.size():
-            self.dfl.selection_set(self.index)
+        self.down_frame_listbox.selection_clear(0, tkinter.END)
+        if self.index is not None and 0 <= self.index < self.down_frame_listbox.size():
+            self.down_frame_listbox.selection_set(self.index)
 
 
     def flush_music(self):
         self.music_dict=self.load_music()
         keys = list(self.music_dict.keys())
-        self.player.set_d(self.music_dict,self.dfl)
-        self.dfl.delete(0,tkinter.END)
+        self.player.set_dict_and_tk_obj(self.music_dict,self.down_frame_listbox,self.play_status_label)
+        self.down_frame_listbox.delete(0,tkinter.END)
         for asa in keys:
-            self.dfl.insert(tkinter.END,asa)
+            self.down_frame_listbox.insert(tkinter.END,asa)
         
         
         self.index = None
-        self.player._gen += 1
-        self.player._stop_listen()
-        self.dfl.selection_clear(0,tkinter.END)
+        self.player.stop_listen()
+        self.down_frame_listbox.selection_clear(0,tkinter.END)
 
 
-    def load_music(self):
+    @staticmethod
+    def load_music():
         aaa = {}
         music_dir = os.path.join(BASE_DIR,'music')
-        for a in os.listdir(music_dir):
+        for a in sorted(os.listdir(music_dir)):
             b = os.path.join(music_dir,a)
             if not os.path.isdir(b):
                 continue
@@ -924,9 +1134,27 @@ class tkapp:
             except Exception as e:
                 print(f'读取 {info} 失败:{e}')
                 continue
-            name = n.get('name') or a       
-            fn = n.get('file','')
-            mv = n.get('mv','')
+            if not isinstance(n,dict):
+                print(f'{info} 的内容不是 JSON 对象,跳过 {a}')
+                continue
+
+            try:
+                name = n.get('name') or a
+                fn = n.get('file','') or NO_FILE
+                mv = n.get('mv','') or NO_FILE
+                if not isinstance(name,str):
+                    print(f'{info} 里的 name 不是字符串,改用目录名 {a}')
+                    name = a
+                if not isinstance(fn,str) or not isinstance(mv,str):
+                    print(f'{info} 里的 file/mv 不是字符串,忽略这两个字段')
+                    fn = fn if isinstance(fn,str) else ''
+                    mv = mv if isinstance(mv,str) else ''
+            except Exception as e:
+                print(f'解析 {info} 失败,跳过 {a}:{e}')
+                continue
+            if not name:
+                print(f'跳过 {a}:名称为空')
+                continue
             music = os.path.join(b,fn) if fn and os.path.isfile(os.path.join(b,fn)) else NO_FILE
             video = os.path.join(b,mv) if mv and os.path.isfile(os.path.join(b,mv)) else NO_FILE
             if music == NO_FILE and video == NO_FILE:
@@ -946,16 +1174,11 @@ class tkapp:
 
 
 def main():
-    """建窗口并进入主循环。
 
-    原来 pro = tkapp() 写在模块顶层,于是 `import b` 就会弹窗口、起托盘线程 ——
-    测试、类型检查、以及任何想复用 b.py 的代码都会踩到。插件并不依赖这个全局:
-    plugin.init_i()/run() 会把实例注入插件命名空间的 'pro',所以收进函数里是安全的。
-    """
-    pro = tkapp()
+    pro = Tkapp()
     pro.run()
 
-pro:tkapp
+pro:Tkapp
 if __name__ == "__main__":
     try:
         

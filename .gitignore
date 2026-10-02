@@ -22,3 +22,5 @@ exit
 config.json
 plugin/
 tmp*
+.idea
+j.py
