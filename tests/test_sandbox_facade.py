@@ -273,6 +273,7 @@ def t_docs_and_example_plugin():
     assert '装载,manifest name = sandbox_demo' in out, out
     assert '预期行为' in out, out
     assert os.path.isfile(os.path.join(d, 'demo_out.txt'))
+    os.remove(os.path.join(d, 'demo_out.txt'))        # 自测不留垃圾
 
 
 if __name__ == '__main__':
