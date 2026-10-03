@@ -25,3 +25,5 @@ tmp*
 .idea
 j.py
 __pycache__/j.cpython-313.pyc
+*.log
+_t_*.py
