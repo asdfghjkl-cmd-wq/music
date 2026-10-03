@@ -13,7 +13,7 @@ import logging
 # 插件沙盒:能力模型、路径判定、封存与审计都在 plugin_sandbox.py 里。
 # env_box 由它提供,替代原先那个把 b.py 的 globals() 整个暴露给插件的实现。
 from plugin_sandbox import (env_box, parse_policy, SandboxDenied, _HOST_TOKEN,
-                            ASK_YES, ASK_SESSION, ASK_ALWAYS)
+                            ASK_YES, ASK_SESSION, ASK_ALWAYS, install_audit_hook)
 
 
 
@@ -1577,6 +1577,10 @@ def main():
                         filename=os.path.join(BASE_DIR,'music.log'),
                         encoding='utf-8',
                         format='%(asctime)s %(levelname)s [%(threadName)s] %(message)s')
+
+    # 审计钩子:插件绕开沙盒门面(内省拿到真 os/socket)时的第二道闸
+    if install_audit_hook():
+        print('[沙盒] 审计钩子已安装:绕开门面的文件/网络/进程访问同样会被拦')
 
     pro = Tkapp()
     pro.app.focus_get()

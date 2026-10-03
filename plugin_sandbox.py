@@ -31,6 +31,7 @@ plugin.json 里的声明方式:
 
 import builtins as _builtins
 import collections
+import copy
 import datetime
 import functools
 import http.client
@@ -344,12 +345,31 @@ class SandBox:
         self._ask = None
         self._persist = None
         self._host = None
+        self._facade = None              # 插件真正拿到的 pro(白名单门面)
         self._local_modules = {}
         self._module_cache = {}
         self.__sealed = False            # 名字改写后是 _SandBox__sealed
         self._build_namespace()
+        register_plugin_frames(self)     # 让审计钩子认得"这是插件的代码帧"
 
     # ---------------- 封存与授权 ----------------
+
+    @property
+    def frame_tag(self):
+        """b.py 用 <plugin 名字 init/command> 当编译出来的文件名,靠它认插件帧。"""
+        return f'<plugin {self.name} '
+
+    def _guarded(self,func,*args,**kwargs):
+        """执行"沙盒 / 宿主替插件做的真实调用"。
+
+        这期间审计钩子放行:权限刚刚已经查过了。顺带也避免了钩子自己的
+        策略检查(realpath 会触发 os.lstat 审计事件)递归回来。
+        """
+        _facade_enter()
+        try:
+            return func(*args,**kwargs)
+        finally:
+            _facade_exit()
 
     def seal(self):
         """冻结策略。之后连宿主也不能再 grant,插件更不行。"""
@@ -422,12 +442,14 @@ class SandBox:
         """func(plugin_name,cap,target) -> None:把授权写进 config.json。"""
         self._persist = func
 
-    def attach_host(self,tkaapp,**kwargs):
-        """把宿主对象放进命名空间(Phase 4 会换成收窄过的门面)。"""
+    def attach_host(self,tkaapp,facade=None,**kwargs):
+        """把宿主以"白名单门面"的形式交给插件(不再是整个 Tkapp)。"""
         self._host = tkaapp
-        if tkaapp is not None:
-            self.namespace['pro'] = tkaapp
-        return tkaapp
+        if tkaapp is None:
+            return None
+        self._facade = HostFacade(self,tkaapp) if facade is None else facade
+        self.namespace['pro'] = self._facade
+        return self._facade
 
     def audit(self,limit=20):
         return list(self.events[-limit:])
@@ -442,8 +464,12 @@ class SandBox:
 
     def violation(self,action,detail,target):
         self.note('violation:'+action,'*',target,detail)
-        logging.warning('插件 %s 触发沙盒拦截:%s(%s)',self.name,detail,target)
-        print(f'[沙盒] 插件 {self.name}:{detail}')
+        _facade_enter()
+        try:
+            logging.warning('插件 %s 触发沙盒拦截:%s(%s)',self.name,detail,target)
+            print(f'[沙盒] 插件 {self.name}:{detail}')
+        finally:
+            _facade_exit()
 
     # ---------------- 能力判定 ----------------
 
@@ -475,7 +501,7 @@ class SandBox:
             return False
         self._asked.add(key)
         try:
-            ans = self._ask(self,cap,target,detail)
+            ans = self._guarded(self._ask,self,cap,target,detail)
         except Exception:
             logging.exception('插件沙盒的授权询问失败,按拒绝处理')
             return False
@@ -528,16 +554,19 @@ class SandBox:
             self.violation('fd','不支持用文件描述符打开文件',file)
             raise SandboxDenied('沙盒不允许用文件描述符(fd)打开文件')
         path = self.check_fs(file,_mode_writes(mode),f'open({mode!r})')
-        return _builtins.open(path,mode,*args,**kwargs)
+        return self._guarded(_builtins.open,path,mode,*args,**kwargs)
 
     def fs_listdir(self,path='.'):
-        return os.listdir(self.check_fs(path,False,'listdir'))
+        p = self.check_fs(path,False,'listdir')
+        return self._guarded(os.listdir,p)
 
     def fs_scandir(self,path='.'):
-        return list(os.scandir(self.check_fs(path,False,'scandir')))
+        p = self.check_fs(path,False,'scandir')
+        return self._guarded(lambda q:list(os.scandir(q)),p)
 
     def fs_stat(self,path,**kwargs):
-        return os.stat(self.check_fs(path,False,'stat'),**kwargs)
+        p = self.check_fs(path,False,'stat')
+        return self._guarded(lambda *a,**k:os.stat(*a,**k),p,**kwargs)
 
     def fs_walk(self,top,*args,**kwargs):
         top = self.check_fs(top,False,'walk')
@@ -549,12 +578,15 @@ class SandBox:
         return _gen()
 
     def fs_write_call(self,func,what,path,*args,**kwargs):
-        return func(self.check_fs(path,True,what),*args,**kwargs)
+        p = self.check_fs(path,True,what)
+        return self._guarded(func,p,*args,**kwargs)
 
     def fs_rename(self,src,dst,**kwargs):
         src = self.check_fs(src,True,'rename')
         dst = self.check_fs(dst,True,'rename')
-        return os.replace(src,dst) if kwargs.pop('replace',False) else os.rename(src,dst)
+        if kwargs.pop('replace',False):
+            return self._guarded(os.replace,src,dst)
+        return self._guarded(os.rename,src,dst)
 
     def fs_probe(self,func,path,*args,**kwargs):
         """只读探测(exists/isfile/isdir/getsize):没权限就安静地返回 False/0。
@@ -575,14 +607,14 @@ class SandBox:
         @functools.wraps(func)
         def wrapper(*args,**kwargs):
             self.check_net(what)
-            return func(*args,**kwargs)
+            return self._guarded(func,*args,**kwargs)
         return wrapper
 
     def proc_guard(self,func,what):
         @functools.wraps(func)
         def wrapper(*args,**kwargs):
             self.check_proc(what)
-            return func(*args,**kwargs)
+            return self._guarded(func,*args,**kwargs)
         return wrapper
 
     # ---------------- 模块门面 ----------------
@@ -686,12 +718,12 @@ class SandBox:
     def guarded_image_open(self,fp,*args,**kwargs):
         if isinstance(fp,(str,bytes,os.PathLike)):
             fp = self.check_fs(fp,False,'PIL.Image.open')
-        return _PILImage.open(fp,*args,**kwargs)
+        return self._guarded(_PILImage.open,fp,*args,**kwargs)
 
     def guarded_mutagen_file(self,filething,*args,**kwargs):
         if isinstance(filething,(str,bytes,os.PathLike)):
             filething = self.check_fs(filething,False,'读取音频标签')
-        return mutagen.File(filething,*args,**kwargs)
+        return self._guarded(mutagen.File,filething,*args,**kwargs)
 
     def socket_module(self):
         allow = {'AF_INET','AF_INET6','AF_UNIX','SOCK_STREAM','SOCK_DGRAM','SOL_SOCKET',
@@ -812,7 +844,7 @@ class SandBox:
         mod.__dict__['__file__'] = target
         self._local_modules[name] = mod
         try:
-            with _builtins.open(target,'r',encoding='utf-8') as fp:
+            with self._guarded(_builtins.open,target,'r',encoding='utf-8') as fp:
                 code = compile(fp.read(),target,'exec')
             exec(code,mod.__dict__)
         except Exception:
@@ -882,7 +914,9 @@ class SandBox:
         g = self._scope(globals)
         return _builtins.exec(source,g,g if locals is None else locals)
 
-    def sandbox_compile(self,source,filename='<plugin>',mode='exec',*args,**kwargs):
+    def sandbox_compile(self,source,filename=None,mode='exec',*args,**kwargs):
+        if filename is None:
+            filename = f'<plugin {self.name} exec>'
         return _builtins.compile(source,filename,mode,*args,**kwargs)
 
     # ---------------- 命名空间 ----------------
@@ -893,6 +927,7 @@ class SandBox:
         ns['__doc__'] = None
         ns['__builtins__'] = self.restricted_builtins()
         ns['__sandbox__'] = SandboxView(self)
+        ns['SandboxDenied'] = SandboxDenied    # 插件可以精确地 except 它
         ns['open'] = self.fs_open
         for name,mod in self._PASSTHROUGH.items():
             if '.' not in name:
@@ -907,7 +942,7 @@ class SandBox:
         ns['plugin_dir'] = self.plugin_dir
         ns['__env_id__'] = self.env_id     # 老插件(如 plugin/nb)在用它
         if self._host is not None:
-            ns['pro'] = self._host      # 重建命名空间(合并 env)时别把宿主弄丢
+            ns['pro'] = self._facade or self._host   # 重建命名空间时别把宿主弄丢
         return ns
 
 
@@ -1006,3 +1041,278 @@ def _merge_policy(old,new,old_name,new_name):
     merged.modules = list(dict.fromkeys(list(old.modules) + list(new.modules)))
     merged.warnings = [f'与 {old_name} / {new_name} 共用 env_id,策略已合并']
     return merged
+
+
+# ---------------------------------------------------------------- 宿主门面
+
+class _MenuFacade:
+    """只放行"往菜单里加东西"。不给控件对象:控件有 .tk,那就是 Tcl 通道。"""
+
+    __slots__ = ('_sb','_menu')
+
+    _ALLOW = ('add_command','add_separator','add_checkbutton','add_radiobutton')
+
+    def __init__(self,sb,menu):
+        self._sb = sb
+        self._menu = menu
+
+    def _delegate(self,item):
+        # 用闭包包一层,不把绑定方法交出去:绑定方法的 __self__ 是控件,
+        # 而控件有 .tk 通道(这条只是抬高门槛,不是边界,见 SANDBOX.md)
+        target = getattr(self._menu,item)
+
+        def call(*a,**k):
+            return target(*a,**k)
+        return call
+
+    def __getattr__(self,item):
+        if item in self._ALLOW and self._menu is not None:
+            return self._delegate(item)
+        self._sb.violation('host_attr',f'插件不能访问 pro.menu.{item}',None)
+        raise SandboxDenied(f'插件不能访问 pro.menu.{item}(只能加菜单项)')
+
+    def __repr__(self):
+        return f'<sandbox menu for {self._sb.name}>'
+
+
+class _AppFacade:
+    """主窗口门面:白名单,不暴露 tk/call/eval/winfo_children/nametowidget。"""
+
+    __slots__ = ('_sb','_app')
+
+    _ALLOW = ('after','after_idle','after_cancel','title','geometry','deiconify',
+              'withdraw','iconify','destroy','update','update_idletasks',
+              'bind','unbind','bind_all','unbind_all','resizable','minsize','maxsize',
+              'winfo_width','winfo_height','winfo_screenwidth','winfo_screenheight',
+              'winfo_x','winfo_y','winfo_exists','attributes')
+
+    def __init__(self,sb,app):
+        self._sb = sb
+        self._app = app
+
+    def _delegate(self,item):
+        target = getattr(self._app,item)
+
+        def call(*a,**k):
+            return target(*a,**k)
+        return call
+
+    def __getattr__(self,item):
+        if item in self._ALLOW and self._app is not None:
+            return self._delegate(item)
+        self._sb.violation('host_attr',f'插件不能访问 pro.app.{item}',None)
+        raise SandboxDenied(
+            f'插件不能访问 pro.app.{item}'
+            f'(Tk 的 Tcl 通道沙盒挡不住,所以这里只放行白名单方法)')
+
+    def __repr__(self):
+        return f'<sandbox app for {self._sb.name}>'
+
+
+class HostFacade:
+    """插件看到的 pro。
+
+    旧版把整个 Tkapp 交给插件,于是 pro.player.music_player(能放任意 URL/文件)、
+    pro.app.tk.eval("exec ...")、pro.env_dict(注册表)、pro.plugin_list(别人的命名
+    空间)全敞着 —— 等于绕开前面所有能力检查。现在只给这几样:
+        pro.menu            加菜单项
+        pro.app             白名单方法(窗口标题/几何/after/destroy...)
+        pro.music_dict      播放列表的深拷贝快照(改了不影响播放器)
+        pro.plugin_names    已加载插件的名字(不给对象)
+    """
+
+    __slots__ = ('_sb','_pro','menu','app')
+
+    def __init__(self,sb,pro):
+        self._sb = sb
+        self._pro = pro
+        self.menu = _MenuFacade(sb,getattr(pro,'menu',None))
+        self.app = _AppFacade(sb,getattr(pro,'app',None))
+
+    @property
+    def music_dict(self):
+        try:
+            return copy.deepcopy(self._pro.music_dict)
+        except Exception:
+            logging.exception('取播放列表快照失败,返回空表')
+            return {}
+
+    @property
+    def plugin_names(self):
+        try:
+            return [getattr(p,'name','') for p in self._pro.plugin_list]
+        except Exception:
+            return []
+
+    def __getattr__(self,item):
+        self._sb.violation('host_attr',f'插件不能访问 pro.{item}',None)
+        raise SandboxDenied(
+            f'插件不能访问 pro.{item};可用的是 pro.menu / pro.app / '
+            f'pro.music_dict / pro.plugin_names')
+
+    def __repr__(self):
+        return f'<sandbox host facade for {self._sb.name}>'
+
+
+# ---------------------------------------------------------------- 审计钩子
+
+# 门面 / 宿主替插件做事时置位:这期间审计钩子放行(权限已经查过,也避免递归)
+_FRAME_LOCAL = threading.local()
+_FRAME_TAGS = {}          # '<plugin 名字 ' -> SandBox
+_FRAME_DIRS = []          # [(规范化插件目录, SandBox)]
+_HOOK_INSTALLED = False
+
+# 实测:CPython 的审计表里没有 os.stat/os.lstat(它们不产生事件),
+# 所以"探测文件是否存在/多大"在内省路径下挡不住 —— 这是已知缺口,
+# 写在 SANDBOX.md 的"已知的坑"里,别指望这里。
+_FS_READ_EVENTS = ('os.listdir','os.scandir')
+_FS_WRITE_EVENTS = ('os.mkdir','os.rmdir','os.remove','os.utime','os.chmod',
+                    'os.truncate','os.link','os.symlink')
+_PROC_EVENTS = ('os.system','os.exec','os.spawn','os.posix_spawn','os.startfile',
+                'os.fork','os.forkpty','subprocess.Popen','ctypes.dlopen','pty.spawn')
+_NET_EVENTS = ('socket.__new__','socket.connect','socket.bind','socket.getaddrinfo',
+               'socket.gethostbyname','socket.sendto')
+
+_O_WRITE_FLAGS = 0
+for _flag in ('O_WRONLY','O_RDWR','O_CREAT','O_APPEND','O_TRUNC'):
+    _O_WRITE_FLAGS |= getattr(os,_flag,0)
+
+
+def _facade_enter():
+    _FRAME_LOCAL.depth = getattr(_FRAME_LOCAL,'depth',0) + 1
+
+
+def _facade_exit():
+    _FRAME_LOCAL.depth = max(getattr(_FRAME_LOCAL,'depth',1) - 1,0)
+
+
+def _always_readable(path):
+    """解释器自己的目录(site-packages/stdlib)永远可读。
+
+    否则插件界面一碰到 ttkbootstrap/PIL 读自带资源就会被钩子拦下。
+    """
+    for root in _ALWAYS_READABLE:
+        if under(root,path):
+            return True
+    return False
+
+
+def register_plugin_frames(box):
+    _FRAME_TAGS[box.frame_tag] = box
+    _FRAME_DIRS.append((_norm(box.plugin_dir),box))
+
+
+def _box_for_frame(filename):
+    if not filename:
+        return None
+    for tag,box in _FRAME_TAGS.items():
+        if filename.startswith(tag):
+            return box
+    for root,box in _FRAME_DIRS:
+        if root and under(root,filename):
+            return box
+    return None
+
+
+def _plugin_box_on_stack():
+    """从调用栈里找最近的插件代码帧(找不到就是宿主自己在访问)。"""
+    try:
+        frame = sys._getframe(1)
+    except ValueError:
+        return None
+    depth = 0
+    while frame is not None and depth < 200:
+        box = _box_for_frame(frame.f_code.co_filename)
+        if box is not None:
+            return box
+        frame = frame.f_back
+        depth += 1
+    return None
+
+
+def _is_pathlike(value):
+    return isinstance(value,(str,bytes,os.PathLike))
+
+
+def _audit_target(event,args):
+    """把审计事件翻译成 (能力, 路径, 说明);不关心的返回 None。"""
+    a = list(args)
+    if event == 'open':
+        p = a[0] if a else None
+        if not _is_pathlike(p):
+            return None
+        mode = a[1] if len(a) > 1 else None
+        flags = a[2] if len(a) > 2 else None
+        write = False
+        if isinstance(mode,str):
+            write = any(c in mode for c in ('w','a','x','+'))
+        if isinstance(flags,int):
+            write = write or bool(flags & _O_WRITE_FLAGS)
+        return ('fs:write' if write else 'fs:read',os.fspath(p),f'open({mode!r})')
+    if event == 'os.rename' or event == 'os.replace':
+        paths = [os.fspath(x) for x in a[:2] if _is_pathlike(x)]
+        return ('fs:write',paths,event) if paths else None
+    if event in _FS_READ_EVENTS:
+        p = a[0] if a else None
+        return ('fs:read',os.fspath(p),event) if _is_pathlike(p) else None
+    if event in _FS_WRITE_EVENTS:
+        p = a[0] if a else None
+        return ('fs:write',os.fspath(p),event) if _is_pathlike(p) else None
+    if event in _NET_EVENTS:
+        return ('net',None,event)
+    if event in _PROC_EVENTS:
+        return ('proc',None,event)
+    return None
+
+
+def _audit_hook(event,args):
+    """进程级审计钩子:插件绕开沙盒门面(内省拿真模块)时,这里兜底。"""
+    if getattr(_FRAME_LOCAL,'depth',0):
+        return                                  # 门面/宿主自己发起,权限已查过
+    _facade_enter()
+    try:
+        target = _audit_target(event,args)
+        if target is None:
+            return
+        box = _plugin_box_on_stack()
+        if box is None or box.policy.unsafe:
+            return                              # 不是插件干的,或用户放开了它
+        cap,path,what = target
+        paths = path if isinstance(path,list) else [path]
+        for one in paths:
+            if cap == 'fs:read' and one and _always_readable(one):
+                continue
+            if not box.can(cap,one):
+                box.violation('audit',f'绕过沙盒门面的 {what} 被审计钩子拦下',one)
+                raise SandboxDenied(
+                    f'插件 {box.name} 的 {what} 绕过了沙盒门面,被审计钩子拒绝:{one}')
+    except SandboxDenied:
+        raise
+    except Exception:
+        # 钩子自己出问题不能把播放器带崩:记一次日志后放行
+        if not getattr(_FRAME_LOCAL,'warned',False):
+            _FRAME_LOCAL.warned = True
+            logging.exception('沙盒审计钩子内部出错,该事件放行')
+    finally:
+        _facade_exit()
+
+
+def install_audit_hook():
+    """装一次进程级审计钩子。装了它,插件即便通过内省拿到真的 os/socket,
+    碰文件、联网、起进程也会被拦(门面之外的第二道闸)。
+
+    说明:钩子只在"栈上确实有插件代码帧"时才动手,宿主自己的访问不受影响;
+    C 扩展直接调系统接口(比如 Tcl 自己 exec)不在审计事件里,仍挡不住。
+    """
+    global _HOOK_INSTALLED
+    if _HOOK_INSTALLED:
+        return False
+    _HOOK_INSTALLED = True
+    sys.addaudithook(_audit_hook)
+    logging.info('插件沙盒审计钩子已安装')
+    return True
+
+
+_ALWAYS_READABLE = tuple(_norm(p) for p in
+                         (sys.prefix,sys.base_prefix,os.path.dirname(os.__file__))
+                         if p)
