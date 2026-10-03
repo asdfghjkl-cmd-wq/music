@@ -12,7 +12,8 @@ import logging
 
 # 插件沙盒:能力模型、路径判定、封存与审计都在 plugin_sandbox.py 里。
 # env_box 由它提供,替代原先那个把 b.py 的 globals() 整个暴露给插件的实现。
-from plugin_sandbox import env_box, parse_policy, SandboxDenied
+from plugin_sandbox import (env_box, parse_policy, SandboxDenied, _HOST_TOKEN,
+                            ASK_YES, ASK_SESSION, ASK_ALWAYS)
 
 
 
@@ -663,10 +664,7 @@ class Plugin:
         # 沙盒策略:plugin.json 的 sandbox 段 + 历史 privilege。
         # 解析只做校验:字段写错只会更严,不会变成"不受限制"。
         self.sandbox_policy = parse_policy(n.get('sandbox',None),self.privilege,dir)
-        if self.sandbox_policy.unsafe:
-            # unsafe 必须由用户明确同意(装载确认框,Phase 3);在那之前先按受限处理
-            self.sandbox_policy.unsafe = False
-            self.sandbox_policy.warnings.append('声明了"不受沙盒限制",但还没得到你的确认,先按受限处理')
+        # unsafe 只是插件"申请",要不要放开由宿主在装载时问用户(见 _confirm_unsafe)
         for w in self.sandbox_policy.warnings:
             print(f'[沙盒] {self.plugin_file_path}:{w}')
 
@@ -676,8 +674,10 @@ class Plugin:
     def init_env(self):
 
         # 命名空间由沙盒提供:默认只给"读插件自己的目录",写/网络/进程都要授权。
+        # 建沙盒要带宿主凭据:插件自己调 create 是改不动策略的
         self._box = self.env_dict.create(self.env_id,self.name,self.dir,
-                                         self.sandbox_policy)
+                                         self.sandbox_policy,
+                                         _host_token=_HOST_TOKEN)
         self._env_dict = self._box.namespace
 
         
@@ -744,7 +744,8 @@ class Plugin:
 
 class Config:
 
-    DEFAULT = {'theme': 'solarized-light', 'exit_way': 0,'allow_plugin':[]}
+    DEFAULT = {'theme': 'solarized-light', 'exit_way': 0,'allow_plugin':[],
+               'plugin_unsafe':[],'plugin_grants':{}}
 
     @classmethod
     def _default(cls,key):
@@ -757,6 +758,8 @@ class Config:
         self.theme = self._default('theme')
         self.exit_way = self._default('exit_way')
         self.allow_plugin = self._default('allow_plugin')
+        self.plugin_unsafe = self._default('plugin_unsafe')
+        self.plugin_grants = self._default('plugin_grants')
         self.load()
     
     def load(self):
@@ -798,6 +801,55 @@ class Config:
                 print(f'{self.path} 里的 allow_plugin 不是数组,按默认值处理')
             self.allow_plugin = self._default('allow_plugin')
 
+        u = n.get('plugin_unsafe',None)
+        if isinstance(u,list):
+            self.plugin_unsafe = list(dict.fromkeys(x for x in u
+                                                  if isinstance(x,str) and x))
+        elif u is not None:
+            print(f'{self.path} 里的 plugin_unsafe 不是数组,按默认值处理')
+            self.plugin_unsafe = self._default('plugin_unsafe')
+
+        g = n.get('plugin_grants',None)
+        if isinstance(g,dict):
+            # 只收:插件名 -> {fs_read/fs_write: [路径], net/proc: true}
+            self.plugin_grants = {}
+            for who,item in g.items():
+                if not isinstance(who,str) or not who or not isinstance(item,dict):
+                    print(f'{self.path} 里的 plugin_grants {who!r} 无效,已忽略')
+                    continue
+                one = {}
+                for key in ('fs_read','fs_write'):
+                    v = item.get(key,None)
+                    if v is None:
+                        continue
+                    if isinstance(v,str):
+                        v = [v]
+                    if not isinstance(v,list):
+                        print(f'{self.path} 里 {who} 的 {key} 不是数组,已忽略')
+                        continue
+                    paths = []
+                    for p in v:
+                        if isinstance(p,str) and p.strip():
+                            paths.append(os.path.normpath(p))
+                        else:
+                            print(f'{self.path} 里 {who} 的 {key} 有无效项 {p!r},已忽略')
+                    if paths:
+                        one[key] = paths
+                for key in ('net','proc'):
+                    v = item.get(key,None)
+                    if v is None:
+                        continue
+                    if not isinstance(v,bool):
+                        print(f'{self.path} 里 {who} 的 {key} 不是布尔值,已忽略')
+                        continue
+                    if v:
+                        one[key] = True
+                if one:
+                    self.plugin_grants[who] = one
+        elif g is not None:
+            print(f'{self.path} 里的 plugin_grants 不是对象,按默认值处理')
+            self.plugin_grants = self._default('plugin_grants')
+
         try:
             self.exit_way = int(n.get('exit_way',self._default('exit_way')))
         except (TypeError,ValueError):
@@ -807,6 +859,39 @@ class Config:
         if self.exit_way not in (0,1,2):
             print(f'{self.path} 里的 exit_way={self.exit_way} 已失效,按默认值处理')
             self.exit_way = self._default('exit_way')
+
+    def grants_for(self,name):
+        """把 config 里记住的授权摊平成 (能力,目标) 列表,装载时喂回沙盒。"""
+        g = self.plugin_grants.get(name) or {}
+        out = []
+        for p in g.get('fs_read',()) or ():
+            out.append(('fs:read',p))
+        for p in g.get('fs_write',()) or ():
+            out.append(('fs:write',p))
+        if g.get('net'):
+            out.append(('net',None))
+        if g.get('proc'):
+            out.append(('proc',None))
+        return out
+
+    def grant(self,name,cap,target=None):
+        """记一条授权:插件运行期点"总是允许"时由播放器调用,随后由 save() 落盘。"""
+        g = self.plugin_grants.setdefault(name,{})
+        if cap in ('fs:read','fs:write'):
+            key = 'fs_read' if cap == 'fs:read' else 'fs_write'
+            if not target:
+                return g
+            # 沙盒的白名单是"目录级"的:这里归一成真正生效的目录,
+            # 免得 config.json 里记着一个文件路径、实际放开的却是整个目录
+            target = os.path.normpath(os.path.abspath(target))
+            if not os.path.isdir(target):
+                target = os.path.dirname(target) or target
+            g.setdefault(key,[])
+            if target not in g[key]:
+                g[key].append(target)
+        elif cap in ('net','proc'):
+            g[cap] = True
+        return g
 
     def _backup_broken_config(self):
         """把无法解析的配置挪到带时间戳的 .bak,备份失败也不影响启动。
@@ -829,6 +914,8 @@ class Config:
         self._dict['theme'] = self.theme
         self._dict['exit_way'] = self.exit_way
         self._dict['allow_plugin'] = self.allow_plugin
+        self._dict['plugin_unsafe'] = self.plugin_unsafe
+        self._dict['plugin_grants'] = self.plugin_grants
 
         tmp = self.path + '.tmp'
         try:
@@ -998,6 +1085,17 @@ class Tkapp:
 
         def load_p(n:Plugin):
             n.init_env()
+            # 1) 把 config.json 里记住的授权喂回去(装载期、封存前)
+            for cap,target in self.config.grants_for(n.name):
+                try:
+                    n._box.grant(cap,target,_host_token=_HOST_TOKEN)
+                except SandboxDenied as e:
+                    print(f'[沙盒] 恢复 {n.name} 的授权失败,已忽略:{e}')
+            # 2) unsafe 申请要用户确认过才真的放开
+            self._confirm_unsafe(n)
+            # 3) 运行期要权限时问用户,并把"总是允许"写进 config.json
+            n._box.set_ask(self._plugin_ask)
+            n._box.set_persist(self._plugin_persist)
             n.init_i(self)
             self.plugin_list.append(n)
             
@@ -1027,7 +1125,9 @@ class Tkapp:
                         # 沙盒策略在装载期一次定好(见 plugin_sandbox),插件自己改不了
                         load_p(n)
                     else:
-                        if ttkbootstrap.Messagebox.yesno(f'是否加载{n.name}',title='插件',
+                        ask = (f'是否加载 {n.name}\n\n它申请的权限:\n'
+                               f'{n.sandbox_policy.describe()}')
+                        if ttkbootstrap.Messagebox.yesno(ask,title='插件',
                                                          parent=self.app,buttons=['是','否']) == '是':
                             if ttkbootstrap.Messagebox.yesno('是否默认加载',title='插件',
                                                              parent=self.app,buttons=['是','否']) == '是':
@@ -1358,6 +1458,58 @@ class Tkapp:
             self.player.rearm_listen(self.flush_display)
         self.down_frame_listbox.selection_clear(0,tkinter.END)
 
+
+    # ---------------- 插件沙盒的宿主侧 ----------------
+    _PLUGIN_CAP_TEXT = {'fs:read':'读取文件','fs:write':'写入文件',
+                        'net':'访问网络','proc':'启动外部进程'}
+
+    def _plugin_ask(self,box,cap,target,detail):
+        """插件运行期要权限时弹窗问用户;返回值是沙盒约定的答案。"""
+        what = self._PLUGIN_CAP_TEXT.get(cap,cap)
+        msg = (f'插件「{box.name}」想要{what}。\n\n'
+               f'目标:{target or "(整个能力)"}\n'
+               f'起因:{detail or "未说明"}\n\n'
+               '允许本次 / 本次运行都允许 / 总是允许(写进 config.json) / 拒绝')
+        try:
+            r = ttkbootstrap.Messagebox.yesno(msg,'插件请求权限',parent=self.app,
+                                              buttons=['允许本次','本次运行都允许',
+                                                       '总是允许','拒绝'])
+        except Exception:
+            logging.exception('插件权限询问失败,按拒绝处理')
+            return 'no'
+        return {'允许本次':ASK_YES,'本次运行都允许':ASK_SESSION,
+                '总是允许':ASK_ALWAYS}.get(r,'no')
+
+    def _plugin_persist(self,name,cap,target):
+        """用户点了"总是允许":记进 config.json,以后装载自动生效。"""
+        self.config.grant(name,cap,target)
+        self.config.save()
+        print(f'[沙盒] 已记住:{name} 可以使用 {cap} {target or ""}')
+
+    def _confirm_unsafe(self,n):
+        """插件声明"不受沙盒限制":只有你确认过(记在 config)才真的放开。"""
+        if not n.sandbox_policy.unsafe_requested:
+            return False
+        if n.name in self.config.plugin_unsafe:
+            n._box.set_unsafe(True,_host_token=_HOST_TOKEN)
+            print(f'[沙盒] {n.name} 按你之前的确认,完全不受沙盒限制')
+            return True
+        try:
+            ans = ttkbootstrap.Messagebox.yesno(
+                f'插件「{n.name}」要求完全不受沙盒限制:\n'
+                '它将以播放器的全部权限运行:可以读写任何文件、联网、启动进程。\n\n'
+                '是否允许?(允许后会记在 config.json 的 plugin_unsafe 里)',
+                '插件请求解除沙盒',parent=self.app,buttons=['是','否']) == '是'
+        except Exception:
+            logging.exception('插件解除沙盒的询问失败,按拒绝处理')
+            ans = False
+        if not ans:
+            print(f'[沙盒] {n.name} 要求不受限制但你未同意,按受限处理')
+            return False
+        self.config.plugin_unsafe.append(n.name)
+        self.config.save()
+        n._box.set_unsafe(True,_host_token=_HOST_TOKEN)
+        return True
 
     @staticmethod
     def load_music():

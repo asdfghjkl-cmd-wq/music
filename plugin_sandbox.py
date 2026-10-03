@@ -135,7 +135,8 @@ class Policy:
         self.net = False
         self.proc = False
         self.ask = True
-        self.unsafe = False
+        self.unsafe = False            # 生效值:只有宿主在用户确认后能打开
+        self.unsafe_requested = False   # 插件在 plugin.json 里"要求"不受限制
         self.modules = []
         self.warnings = []
 
@@ -153,7 +154,7 @@ class Policy:
 
     def describe(self):
         if self.unsafe:
-            return '不受沙盒限制(危险)'
+            return '不受沙盒限制(危险,已由你确认)'
         out = [f'读取:{", ".join(self.fs_read) or "无"}',
                f'写入:{", ".join(self.fs_write) or "无(需要时向你申请)"}']
         if self.net:
@@ -162,6 +163,8 @@ class Policy:
             out.append('外部进程:允许')
         if self.modules:
             out.append('额外模块:' + ','.join(self.modules))
+        if self.unsafe_requested:
+            out.append('插件要求不受沙盒限制(你没确认,当前仍受限)')
         return ' | '.join(out)
 
 
@@ -207,7 +210,7 @@ def parse_policy(raw_sandbox,legacy_privilege,plugin_dir):
     if got is not None:
         p.fs_write = got
 
-    for key in ('net','proc','ask','unsafe'):
+    for key in ('net','proc','ask'):
         v = raw.get(key,None)
         if v is None:
             continue
@@ -215,6 +218,14 @@ def parse_policy(raw_sandbox,legacy_privilege,plugin_dir):
             p.warnings.append(f'sandbox.{key} 不是布尔值,未生效')
             continue
         setattr(p,key,v)
+    # unsafe 只是"申请":真正放开要宿主在用户确认后调 set_unsafe()
+    v = raw.get('unsafe',None)
+    if v is not None:
+        if not isinstance(v,bool):
+            p.warnings.append('sandbox.unsafe 不是布尔值,未生效')
+        elif v:
+            p.unsafe_requested = True
+            p.warnings.append('sandbox.unsafe=true:要求完全不受沙盒限制,需要你在装载时确认')
 
     mods = raw.get('modules',None)
     if mods is not None:
@@ -236,7 +247,9 @@ def parse_policy(raw_sandbox,legacy_privilege,plugin_dir):
         legacy = None
     for item in (legacy or ()):
         if item == 'no_sandbox_really':
-            p.unsafe = True
+            p.unsafe_requested = True
+            p.warnings.append('privilege=no_sandbox_really:要求完全不受沙盒限制,'
+                              '需要你在装载时确认')
         elif item == 'built':
             p.warnings.append("privilege 'built' 已被沙盒取代(常用内置函数默认可用),已忽略")
         else:
@@ -362,6 +375,16 @@ class SandBox:
         target = args[1] if len(args) > 1 else kwargs.get('target')
         self._apply_grant(cap,target,persist=False)
         self.note('grant','*',target,f'宿主授予 {cap}')
+
+    def set_unsafe(self,value=True,_host_token=None):
+        """把插件从沙盒里放出来。只有宿主能调,而且必须已经得到用户确认。"""
+        if _host_token is not _HOST_TOKEN:
+            self.violation('set_unsafe','插件试图解除自己的沙盒限制',None)
+            raise SandboxDenied(f'插件 {self.name} 不能解除自己的沙盒限制')
+        if self.is_sealed():
+            raise SandboxDenied(f'插件 {self.name} 的沙盒已封存,不能再改')
+        self.policy.unsafe = bool(value)
+        self.note('unsafe','*',None,f'unsafe={bool(value)}')
 
     def _apply_grant(self,cap,target,persist=False):
         if cap in ('fs:read','fs:write'):
@@ -903,19 +926,30 @@ class env_box:
         self._boxes = {}
         self.__sealed = False
 
-    def create(self,env_id,name,plugin_dir,policy):
+    def create(self,env_id,name,plugin_dir,policy,_host_token=None):
+        """只有宿主能建沙盒/改策略。插件即便拿着 pro.env_dict 也只能取回自己的命名空间。"""
         box = self._boxes.get(env_id)
+        if _host_token is not _HOST_TOKEN:
+            if box is None:
+                raise SandboxDenied(f'只有宿主能创建插件沙盒(env_id={env_id!r})')
+            box.violation('create','插件试图改造已有沙盒',env_id)
+            self.a[env_id] = box.namespace
+            return box
         if box is not None:
+            self.a[env_id] = box.namespace      # 自我修复:被删了就重新登记
+            if self.__sealed or box.is_sealed():
+                # 封存之后谁都不能再改策略,只允许把命名空间登记回来
+                return box
             merged = _merge_policy(box.policy,policy,box.name,name)
             if merged is not None:
                 box.policy = merged
                 box._build_namespace()
                 print(f'[沙盒] {name} 与 {box.name} 共用 env_id={env_id},'
                       f'合并后的策略:{merged.describe()}')
-        else:
-            box = SandBox(env_id,name,plugin_dir,policy)
-            self._boxes[env_id] = box
-        self.a[env_id] = box.namespace          # 自我修复:被删了就重新登记
+            return box
+        box = SandBox(env_id,name,plugin_dir,policy)
+        self._boxes[env_id] = box
+        self.a[env_id] = box.namespace
         return box
 
     def sandbox(self,env_id):
