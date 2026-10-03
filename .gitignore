@@ -24,3 +24,4 @@ plugin/
 tmp*
 .idea
 j.py
+__pycache__/j.cpython-313.pyc

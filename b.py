@@ -6,6 +6,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.environ['PYTHON_VLC_MODULE_PATH'] = f"{BASE_DIR}/pvlc"
 from PIL import ImageTk,Image
 import traceback,pystray,ttkbootstrap,json,vlc,mutagen
+import builtins as _pybuiltins
 
 
 
@@ -369,6 +370,199 @@ def fmt_time(ms):
     h,s = divmod(s,3600)
     m,s = divmod(s,60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+class SandBox:
+    # 插件环境。按 env_id 一份命名空间,同 env_id 的插件共享(老行为,保留)。
+    #
+    # 权限生命周期(插件自己提不了权):
+    #   1) 只有装载期能授权:grant() 只在 seal() 之前可用;
+    #   2) 授权表是私有的(_allowed),对外只给只读快照 allowed();
+    #   3) 插件代码真正跑起来之前 seal() 已经调用,此后任何改权限的尝试
+    #      (grant/clear/直接改集合)都会抛 SandBoxSealed,而不是静默生效;
+    #   4) env_id 冲突由播放器裁决(grant 内部),插件自己说了不算。
+    #
+    # 边界说明(别把它当安全隔离):插件和播放器在同一进程里,pro 又是播放器
+    # 对象,所以插件真想折腾宿主是拦不住的。这个类负责的是:插件拿不到裸的
+    # open/eval/exec/__import__,也改不了自己或别人的权限状态(旧版提供
+    # close_add/file_add 这些公开方法,任何插件调一句就能给自己解锁),也不会
+    # 像以前那样把主程序的 builtins 改坏。真正决定"准不准跑"的是 allow_plugin
+    # 白名单和加载时的确认弹窗;要硬隔离只能把插件放进独立进程。
+    # _sealed/_allowed 也挡不住铁了心的人去改私有属性,只是把"顺手就能提权"
+    # 变成"必须明目张胆地动私有属性"。
+    #
+    # 没有 import 权限时,插件还能 import 哪些模块。
+    # 只列纯计算/画界面用的库:os、sys、subprocess、importlib、socket 这些
+    # 能绕过沙箱或直接碰系统的一律不给。
+    SAFE_IMPORT = (
+        'tkinter','ttkbootstrap','PIL','json','math','random','time','datetime',
+        're','collections','itertools','functools','string','copy','queue',
+        'threading','traceback','typing','dataclasses','enum','uuid','base64',
+        'hashlib','binascii','textwrap','pprint','abc','contextlib','decimal',
+        'fractions','statistics','unicodedata','vlc','mutagen',
+    )
+    # 受限内置里剔掉的名字。open/__import__ 由权限单独决定,
+    # 其余几个都是"换个名字就能跳出沙箱"的常见入口,不能留。
+    UNSAFE_BUILTIN = (
+        'open','__import__','eval','exec','compile','input','breakpoint',
+        'exit','quit','help','globals','locals','vars','memoryview','__loader__',
+    )
+
+    # 各权限能给到什么:
+    #   built  -> 完整内置(仍剔掉能绕回真内置的那几个)
+    #   import -> 任意模块都能 import
+    #   file   -> 真的 open,并顺带放开 os
+    #   no_sandbox -> 不受限的"虚拟"内置,但不外泄宿主的真 globals
+    #   no_sandbox_really -> 完整全局环境
+    ALL_PRIVILEGE = ('built','import','file','no_sandbox',"no_sandbox_really")
+
+    def __init__(self,privilege=()):
+        # 私有:外部和插件只能读 allowed(),不能改
+        self.a = {}                     # env_id -> 命名空间(保留原名,插件里有人读)
+        self._allowed = {}
+        self._sealed = False
+        self._seq = 0
+        if privilege:
+            self.grant(None,privilege)
+
+    # ---- 对外只读视图 ----
+    def allowed(self,env_id=None):
+        # env_id 给 None 就返回整张表(浅拷贝),给具体 id 就返回那一个的集合
+        if env_id is None:
+            return {k:set(v) for k,v in self._allowed.items()}
+        return set(self._allowed.get(env_id,()))
+
+    def env_ids(self):
+        return tuple(self._allowed)
+
+    def report(self,env_id=None):
+        # 插件自查用:我现在有哪些权限、少了什么
+        have = self.allowed(env_id)
+        return {
+            'env_id': env_id,
+            'privilege': sorted(have),
+            'missing': [p for p in self.ALL_PRIVILEGE if p not in have],
+            'sealed': self._sealed,
+        }
+
+    # ---- 装载期授权(seal 之后一律拒绝) ----
+    def grant(self,env_id,privilege):
+        # 把一组权限授给 env_id。None 当 env_id 时表示"调用方自己指派",仅供内部/测试。
+        if self._sealed:
+            raise SandBoxSealed('沙箱已冻结,不能再改权限(权限只能在加载插件时声明)')
+        env_id = str(env_id) if env_id is not None else self._auto_id()
+        bad = [p for p in privilege if p not in self.ALL_PRIVILEGE]
+        if bad:
+            raise ValueError(f'未知权限:{bad!r},可用的是 {self.ALL_PRIVILEGE}')
+        old = self._allowed.get(env_id,set())
+        new = old | set(privilege)
+        if old and old != new and not self._same_privilege(env_id,privilege):
+            # 同 env_id 被两组不同权限声明:老行为是共享命名空间,那低权限插件
+            # 就白拿高权限了。这里不静默并集,而是把后来者挪到独立 id。
+            moved = self._auto_id()
+            print(f'env_id={env_id!r} 已被权限 {sorted(old)} 占用,'
+                  f'权限 {sorted(privilege)} 改用独立环境 {moved!r}')
+            env_id = moved
+            new = set(privilege)
+        self._allowed[env_id] = new
+        return env_id
+
+    def seal(self):
+        # 装载完成、插件代码开始跑之前调用。之后再改权限就抛异常。
+        self._sealed = True
+        return self
+
+    def _same_privilege(self,env_id,privilege):
+        # 同一插件声明两次同样的权限(或子集)是允许的,不算冲突
+        return set(privilege) <= self._allowed.get(env_id,set())
+
+    def _auto_id(self):
+        while True:
+            self._seq += 1
+            cand = f'auto:{self._seq}'
+            if cand not in self._allowed and cand not in self.a:
+                return cand
+
+    def _safe_import(self,env_id):
+        # 受限 __import__:按各自权限决定放不放行。
+        # 这个包装函数必须真的去调真正的 __import__,而不是返回现成模块,
+        # 否则 import os.path 这种子模块导入会拿到父模块,插件里就张冠李戴了。
+        real_import = _pybuiltins.__import__
+        def _imp(name,globals=None,locals=None,fromlist=(),level=0):
+            # 权限实时查私有表:插件就算把闭包抠出去,查到的还是同一份授权
+            allow = self._allowed.get(env_id,set())
+            # level>0 是相对导入,没有 __package__ 可依据,直接拒掉
+            if level:
+                raise ImportError(f'沙箱内不支持相对导入:{name!r}')
+            root = name.split('.',1)[0]
+            if 'no_sandbox' in allow:
+                pass                      # 声明了不受限,这里就不拦
+            elif root == 'os' and 'file' in allow:
+                pass                      # 有文件权限,顺带放开 os(文件路径操作要用)
+            elif root not in self.SAFE_IMPORT and 'import' not in allow:
+                raise ImportError(
+                    f'当前插件没有 import 权限,不能导入 {name!r}'
+                    f'(可在 plugin.json 的 privilege 里加 "import")')
+            return real_import(name,globals,locals,fromlist,level)
+        return _imp
+
+    def _builtins(self,env_id):
+        # 造一份"干净的内置"。以前的做法是删 nm['__builtins__'],但 exec/eval
+        # 发现命名空间里没有这个键时会自动塞回真正的 builtins,等于没限制;
+        # 而直接删 builtins 模块上的 open/__import__ 又会把整个播放器的主程序
+        # 一起弄坏(内建模块属性本来就删不掉,只会抛错)。所以这里走白名单。
+        allow = self._allowed.get(env_id,set())
+        nm = {}
+        all_builtins = vars(_pybuiltins)
+        if 'no_sandbox_really' in allow:
+            nm.update(all_builtins)
+            print(nm.keys())
+            return nm
+        
+
+        if 'built' in allow or 'no_sandbox' in allow:
+            # 有 built 权限:给完整内置(仍然去掉 __import__,换成受控版本)
+            nm.update(all_builtins)
+        else:
+            for k,v in all_builtins.items():
+                if k in self.UNSAFE_BUILTIN or k.startswith('__'):
+                    continue
+                nm[k] = v
+        # eval/exec/compile/globals 一律不放:它们能绕开这次替换拿回真内置
+        for k in self.UNSAFE_BUILTIN:
+            nm.pop(k,None)
+        nm['__import__'] = self._safe_import(env_id)
+        if 'file' in allow:
+            # file 权限才给真正的 open
+            nm['open'] = all_builtins['open']
+        return nm
+
+    def get(self,name):
+        nm = self.a.get(name,None)
+        # 注意判 None:命名空间可能是空字典,用 if not nm 会把它当成没建过而反复重建
+        if nm is None:
+            d = dict(globals())
+            # 删掉导入器入口,避免插件顺着它拿回真 import
+            for k in ('__loader__','__spec__','__builtins__'):
+                d.pop(k,None)
+            # 插件只能看到 d 里已有的顶层名字(os、sys 这些照样能用,
+            # 因为插件的 `from b import *` 本来就指望它们),但拿不到改成
+            # 白名单的内置。os/sys 仍然保留:删掉它们会让插件普遍不可用,
+            # 而且它们也是插件作者预期的 API 面。
+            # no_sandbox 也不再外泄宿主真 globals:它只是"内置全开",
+            # 免得插件改动直接落进播放器的全局命名空间。
+            d['__env_id__'] = name
+            d['__privilege__'] = frozenset(self._allowed.get(name,()))
+            d['__builtins__'] = self._builtins(name)
+            nm = d
+            self.a[name] = nm
+        return nm
+
+
+class SandBoxSealed(RuntimeError):
+    # 沙箱在插件代码跑起来之前就冻结了,之后任何改权限的尝试都抛这个
+    pass
+
+
 class SeekBar(ttkbootstrap.Frame):
     SCALE_MAX = 1000        
     def __init__(self, master, media_player: "vlc.MediaPlayer",
@@ -465,8 +659,8 @@ class SeekBar(ttkbootstrap.Frame):
 
 
 class Plugin:
-    def __init__(self,dir:str):
-
+    def __init__(self,dir:str,env_dict:SandBox,other_names=None):
+        self.env_dict = env_dict
         self.plugin_file_path = os.path.join(dir,'plugin.json')
         n = {}
         try:
@@ -474,6 +668,7 @@ class Plugin:
                 n = json.load(fp)
         except Exception as e:
             print(f'读取 {self.plugin_file_path} 失败,按空配置处理:{e}')
+            traceback.print_exc()
         if not isinstance(n,dict):
             print(f'{self.plugin_file_path} 的内容不是 JSON 对象,按空配置处理')
             n = {}
@@ -500,17 +695,55 @@ class Plugin:
         
         self.com = None
 
-        self.name = n.get('name','')
+        name = n.get('name','')
+        if isinstance(name,str) and name:
+            self.name = name
+            if other_names is not None:
+                # other_names 是所有插件的名字(含自己),所以先把自己摘掉:
+                # 只有真的被别人占了才改名,免得没重名也加后缀
+                others = set(other_names)
+                others.discard(name)
+                i = 2
+                while self.name in others:
+                    self.name = f'{name} ({i})'
+                    i += 1
+                if self.name != name:
+                    print(f'{self.plugin_file_path} 的 name {name!r} 与别的插件重名,'
+                          f'改用 {self.name!r}')
+        else:
+            # 没有 name 的插件以前会拿到空 env_id,和别的无名插件共用一份命名空间
+            base = os.path.basename(os.path.normpath(dir))
+            self.name = base
+            if other_names is not None:
+                others = set(other_names)
+                i = 2
+                while self.name in others:
+                    self.name = f'{base} ({i})'
+                    i += 1
+            print(f'{self.plugin_file_path} 没有可用的 name,改用目录名 {self.name!r}')
         self.can_exec = n.get('can_exec',False)
         self.exec_path = n.get('exec_path',[])
+        if not isinstance(self.exec_path,(list,tuple)):
+            print(f'插件 {self.name} 的 exec_path 不是数组,按空处理')
+            self.exec_path = []
         
         
+        self.privilege = n.get('privilege',[])
+        if not isinstance(self.privilege,(list,tuple)):
+            print(f'插件 {self.name} 的 privilege 不是数组,按空处理')
+            self.privilege = []
+        self.privilege = [p for p in self.privilege if p in SandBox.ALL_PRIVILEGE]
+        self.n = n
+        # env_id 只是插件作者给的"共享命名空间的名字",不再是权限钥匙:
+        # 权限由播放器用 grant() 单独记,同 env_id 也不会白拿别人的权限
+        self.env_id = str(self.n.get('env_id',self.name))
+    def init_env(self):
         
-        self.env_dict = dict(globals())
+        self._env_dict = self.env_dict.get(self.env_id)
 
         
     def init_i(self,tkaapp):
-        self.env_dict['pro'] = tkaapp
+        self._env_dict['pro'] = tkaapp
         
         if not self.can_exec or self.init_ok:
             return
@@ -524,7 +757,7 @@ class Plugin:
         def _run_init():
             # 插件代码出问题只应该影响它自己,不能把整个播放器带崩
             try:
-                exec(code,self.env_dict)
+                exec(code,self._env_dict)
             except Exception as e:
                 print(f'插件 {self.name} 初始化失败:{e}')
                 traceback.print_exc()
@@ -534,7 +767,7 @@ class Plugin:
     def run(self,tkaapp=None):
         if not self.can_exec or tkaapp is None:
             return
-        self.env_dict['pro'] = tkaapp
+        self._env_dict['pro'] = tkaapp
         if not self.com:
             try:
                 self.com = compile(self.command,f'<plugin {self.name} command>','exec')
@@ -546,7 +779,7 @@ class Plugin:
         
         def _run_command():
             try:
-                exec(self.com,self.env_dict)
+                exec(self.com,self._env_dict)
             except Exception as e:
                 print(f'插件 {self.name} 执行失败:{e}')
                 traceback.print_exc()
@@ -632,7 +865,6 @@ class Config:
             os.replace(tmp,self.path)
         except OSError as e:
             print(f'保存 {self.path} 失败:{e}')
-
 
 
 class Tkapp:
@@ -759,7 +991,8 @@ class Tkapp:
         self.app.bind('<Left>',self.time_minus_ten)
         self.app.bind('<Right>',self.time_add_ten)
         self.app.bind("<Configure>", self.on_resize)
-        
+
+        self.env_dict = SandBox()
 
 
         self.menu.add_command(label='重加载音乐列表',command=self.flush_music)
@@ -781,7 +1014,24 @@ class Tkapp:
         self.run_pause_list = []
         self.run_listbox_list = []
 
+        plugin_dir = os.path.join(BASE_DIR,'plugin')
+        # 先扫一遍插件名:Plugin 用它校验/消歧自己声明的 name,
+        # 免得两个插件同名时抢同一份命名空间和权限
+        plugin_names = set()
+        if os.path.isdir(plugin_dir):
+            for asa in os.listdir(plugin_dir):
+                mn = os.path.join(plugin_dir,asa)
+                if os.path.isdir(mn) and os.path.isfile(os.path.join(mn,'plugin.json')):
+                    try:
+                        with open(os.path.join(mn,'plugin.json'),'r',encoding='utf-8') as fp:
+                            pn = json.load(fp)
+                        if isinstance(pn,dict) and pn.get('name'):
+                            plugin_names.add(pn['name'])
+                    except Exception as e:
+                        print(f'读取 {mn} 的 plugin.json 失败,按无名字处理:{e}')
+
         def load_p(n:Plugin):
+            n.init_env()
             n.init_i(self)
             self.plugin_list.append(n)
             
@@ -794,16 +1044,21 @@ class Tkapp:
                 self.run_pause_list.append(_bind(n.run))
             if 'listbox' in n.exec_path:
                 self.run_listbox_list.append(_bind(n.run))
+
+
         self.scrollbar.grid(row=0,column=1,sticky='n')
         self.down_frame_listbox.bind('<<ListboxSelect>>', self.change_music)
-        if os.path.exists(os.path.join(BASE_DIR,'plugin')) and os.path.isdir(os.path.join(BASE_DIR,'plugin')):
-            for asa in os.listdir(os.path.join(BASE_DIR,'plugin')):
-                mn = os.path.join(BASE_DIR,'plugin',asa)
+        if os.path.isdir(plugin_dir):
+            for asa in os.listdir(plugin_dir):
+                mn = os.path.join(plugin_dir,asa)
                 if not os.path.isdir(mn):continue
                 if not os.path.isfile(os.path.join(mn,'plugin.json')):continue
-                n = Plugin(mn)
+                n = None
                 try:
+                    n = Plugin(mn,self.env_dict,plugin_names)
                     if n.name in self.config.allow_plugin:
+                        # 权限只在装载期授予,而且由播放器自己调,插件碰不到
+                        self.env_dict.grant(n.env_id,n.privilege)
                         load_p(n)
                     else:
                         if ttkbootstrap.Messagebox.yesno(f'是否加载{n.name}',title='插件',
@@ -811,11 +1066,17 @@ class Tkapp:
                             if ttkbootstrap.Messagebox.yesno('是否默认加载',title='插件',
                                                              parent=self.app,buttons=['是','否']) == '是':
                                 self.config.allow_plugin.append(n.name)
+                            self.env_dict.grant(n.env_id,n.privilege)
                             load_p(n)
                 except Exception as e:
                     # 单个插件出问题不该把整个播放器带崩
-                    print(f'加载插件 {n.name} 失败,已跳过:{e}')
+                    who = n.name if n is not None else mn
+                    print(f'加载插件 {who} 失败,已跳过:{e}')
                     traceback.print_exc()
+
+        # 装载结束:从此权限表冻结。这行必须在任何插件代码执行之前,
+        # 因为插件的 init/command 都是 app.after 投递的,要等 mainloop 才开始跑。
+        self.env_dict.seal()
 
 
 
@@ -1179,6 +1440,8 @@ def main():
     pro.run()
 
 pro:Tkapp
+__env_id__:str
+
 if __name__ == "__main__":
     try:
         
