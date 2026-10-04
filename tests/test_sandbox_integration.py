@@ -106,6 +106,19 @@ def t_existing_plugins_still_work():
     finally:
         sys.stdout = old
     assert '64' in buf.getvalue(), buf.getvalue()
+    # 点 debug 菜单项(用户的真实崩溃点就在这里):askstring 打桩,别真弹窗
+    import tkinter.simpledialog as sd
+    orig_ask = sd.askstring
+    sd.askstring = lambda *a, **k: '1+1'
+    buf2, old2 = io.StringIO(), sys.stdout
+    sys.stdout = buf2
+    try:
+        host.menu.commands[0]['command']()      # debug 插件的 debug()
+    finally:
+        sys.stdout = old2
+        sd.askstring = orig_ask
+    out2 = buf2.getvalue()
+    assert '2' in out2 and '1+1' in out2, f'debug() 没跑通:{out2!r}'
     # can_exec=false 的插件一行代码都不许跑
     nb = by['test_2']
     assert nb.can_exec is False and nb.init_ok is False

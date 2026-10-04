@@ -1,19 +1,36 @@
 from threading import Thread
-import tkinter,io,time,random,queue,platform,os,functools,sys,copy
-
-import mutagen.flac
-import mutagen.id3
+import tkinter,io,time,random,queue,platform,os,functools,sys,copy,traceback,json,logging
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-os.environ['PYTHON_VLC_MODULE_PATH'] = f"{BASE_DIR}/pvlc"
-from PIL import ImageTk,Image
-import traceback,pystray,ttkbootstrap,json,vlc,mutagen
-import builtins as _pybuiltins
-import logging
+if platform.system() == 'Windows':
+    os.environ['PYTHON_VLC_MODULE_PATH'] = f"{BASE_DIR}/pvlc"
+try:
+    from PIL import ImageTk,Image
+    import pystray,ttkbootstrap,vlc
+except ModuleNotFoundError:
+    logging.error(f'不是哥们,你是就安装了个python吗,给我去执行"pip install -r {BASE_DIR}{os.sep}requirements.txt"')
+    sys.exit(1)
+start_music_message = True
+try:
+    import mutagen
+    import mutagen.flac
+    import mutagen.id3
+except ModuleNotFoundError:
+    traceback.print_exc()
+    logging.warning('mutagen不存在,无法加载音乐信息')
+    start_music_message = False
 
+
+
+start_plugin = True
 # 插件沙盒:能力模型、路径判定、封存与审计都在 plugin_sandbox.py 里。
 # env_box 由它提供,替代原先那个把 b.py 的 globals() 整个暴露给插件的实现。
-from plugin_sandbox import (env_box, parse_policy, SandboxDenied, _HOST_TOKEN,
+try:
+    from plugin_sandbox import (env_box, parse_policy, SandboxDenied, _HOST_TOKEN,
                             ASK_YES, ASK_SESSION, ASK_ALWAYS, install_audit_hook)
+except ModuleNotFoundError:
+    traceback.print_exc()
+    logging.warning('plugin_sandbox文件不存在,无法加载插件')
+    start_plugin = False
 
 
 
@@ -215,7 +232,7 @@ class Player:
                 self._prompted.add(name)
                 ask = '无法打开音频,可能出现了问题,是否不允许播放'
             self._short_plays = 0
-        elif time.monotonic() - self._play_started < 1.0:
+        elif time.monotonic() - self._play_started < 0.5:
             self._short_plays += 1
             if self._short_plays >= 3:
                 # 数够了就清零:不管回答是"是"还是"否",都不能带着 3 这个计数
@@ -427,6 +444,8 @@ class Player:
         if not path or path == NO_FILE:
             # 没有标签来源:只保留默认封面与空信息,不做无意义的标签读取
             return
+        if not start_music_message:
+            return
         try:
             a = mutagen.File(path,easy=True)
             if a is not None:                  
@@ -583,7 +602,7 @@ class SeekBar(ttkbootstrap.Frame):
 
 
 class Plugin:
-    def __init__(self,dir:str,env_dict:env_box,other_names=None):
+    def __init__(self,dir:str,env_dict,other_names=None):
         self.env_dict = env_dict
         self.plugin_file_path = os.path.join(dir,'plugin.json')
         n = {}
@@ -763,6 +782,13 @@ class Config:
         self.load()
     
     def load(self):
+        # 先把可变状态复位:同一个 Config 对象二次 load(或换了文件)时,
+        # 文件里缺的字段必须回到默认值,而不是留着上一次读到的内容
+        self.theme = self._default('theme')
+        self.exit_way = self._default('exit_way')
+        self.allow_plugin = self._default('allow_plugin')
+        self.plugin_unsafe = self._default('plugin_unsafe')
+        self.plugin_grants = self._default('plugin_grants')
         try:
             with open(self.path,'r',encoding='utf-8') as fp:
                 n = json.load(fp)
@@ -1051,8 +1077,8 @@ class Tkapp:
         self.app.bind('<Left>',self.time_minus_ten)
         self.app.bind('<Right>',self.time_add_ten)
         self.app.bind("<Configure>", self.on_resize)
-
-        self.env_dict = env_box()
+        if start_plugin:
+            self.env_dict = env_box()
 
 
         self.menu.add_command(label='重加载音乐列表',command=self.flush_music)
@@ -1079,9 +1105,11 @@ class Tkapp:
         # 插件的名字"。Plugin 用它给自己声明的 name 消歧:同名插件会被改名,
         # 于是不会共用一份 env 命名空间(env_id 默认就等于 name)。
         # 排序只是为了让改名结果稳定、可复现。
-        assigned_names = set()
-        print('[沙盒] 插件沙盒已启用:默认只允许插件读自己的目录,'
-              '写/网络/外部进程需要授权')
+        if start_plugin:
+            assigned_names = set()
+            print('[沙盒] 插件沙盒已启用:默认只允许插件读自己的目录,'
+                '写/网络/外部进程需要授权')
+            print('\033[91m[warning]只能防老实的插件\n[warning]陌生插件还是发给gpt吧\033[0m',file=sys.stderr)
 
         def load_p(n:Plugin):
             n.init_env()
@@ -1112,7 +1140,7 @@ class Tkapp:
 
         self.scrollbar.grid(row=0,column=1,sticky='n')
         self.down_frame_listbox.bind('<<ListboxSelect>>', self.change_music)
-        if os.path.isdir(plugin_dir):
+        if os.path.isdir(plugin_dir) and start_plugin:
             for asa in sorted(os.listdir(plugin_dir)):
                 mn = os.path.join(plugin_dir,asa)
                 if not os.path.isdir(mn):continue
@@ -1144,7 +1172,8 @@ class Tkapp:
         # 装载到此结束。插件的 init/command 都是 app.after 投递的,要等 mainloop
         # 才开始跑,所以上面这些装载逻辑一定先于任何插件代码执行。
         # 封存沙盒:策略从此冻结,连宿主都不能再改,插件更不可能给自己加权限。
-        self.env_dict.seal()
+        if start_plugin:
+            self.env_dict.seal()
 
 
 
@@ -1237,32 +1266,14 @@ class Tkapp:
     _EXIT_ASK = 2
 
     # 这些控件自己要用方向键做导航/调值,方向键落到它们身上时不该去改播放进度。
-    _NAV_CLASSES = ('Listbox','Text','Entry','TEntry','TCombobox','TScale','Scale','TSpinbox')
 
-    def _nav_focus(self):
-        # 焦点在"自己要用方向键"的控件上时,方向键让给控件本身:
-        # 列表/下拉框要移动选中项,输入框要移动光标,Scale 要左右调值。
-        # 之前这里只有一个调用点却没有实现,一按左右键就 AttributeError,
-        # 键盘前进/后退 10 秒完全用不了。
-        try:
-            w = self.app.focus_get()
-        except tkinter.TclError:
-            return False
-        if w is None:
-            return False
-        try:
-            return w.winfo_class() in self._NAV_CLASSES
-        except tkinter.TclError:
-            return False
 
     def time_add_ten(self,event):
-        if self._nav_focus():
-            return None
+
         self.player.time_add_ten()
         return 'break'
     def time_minus_ten(self,event):
-        if self._nav_focus():
-            return None
+
         self.player.time_minus_ten()
         return 'break'
     def _show_exit_dialog(self) -> int:
@@ -1579,8 +1590,9 @@ def main():
                         format='%(asctime)s %(levelname)s [%(threadName)s] %(message)s')
 
     # 审计钩子:插件绕开沙盒门面(内省拿到真 os/socket)时的第二道闸
-    if install_audit_hook():
-        print('[沙盒] 审计钩子已安装:绕开门面的文件/网络/进程访问同样会被拦')
+    if start_plugin:
+        if install_audit_hook():
+            print('[沙盒] 审计钩子已安装:绕开门面的文件/网络/进程访问同样会被拦')
 
     pro = Tkapp()
     pro.app.focus_get()

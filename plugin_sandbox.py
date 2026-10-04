@@ -801,18 +801,46 @@ class SandBox:
 
     # ---------------- import ----------------
 
-    def import_module(self,name,globals=None,locals=None,fromlist=(),level=0):
-        if not isinstance(name,str) or not name:
-            raise SandboxDenied('import 的模块名无效')
-        if level:
-            self.violation('import','不支持相对 import',name)
-            raise SandboxDenied('沙盒里不支持相对 import')
+    # 这些包的子模块可以直接给真模块(tkinter.ttk / tkinter.scrolledtext /
+    # PIL.ImageDraw…):它们只提供界面/图像工具,本身不含文件、网络、进程能力;
+    # 真去读文件的调用由审计钩子兜底。
+    _SUBMODULE_PACKAGES = ('tkinter','ttkbootstrap','PIL')
+
+    @staticmethod
+    def _dotted_exists(obj,name):
+        """门面背后是真模块/真对象:校验 a.b.c 这条链真的存在。
+
+        否则 `import os.environ.x` 这种(真 Python 里根本不存在的模块)也会被放行,
+        插件会拿到一个莫名其妙的 os 门面。
+        """
+        real = getattr(obj,'_real',obj)
+        for part in name.split('.')[1:]:
+            try:
+                real = getattr(real,part)
+            except AttributeError:
+                return False
+        return True
+
+    def _resolve_module(self,name):
+        """模块名 -> 插件该拿到的东西(受控门面 / 安全模块 / None=不在白名单)。"""
         root = name.split('.')[0]
         built = self.module_builders().get(root)
         if built is not None:
+            if '.' in name and not self._dotted_exists(built,name):
+                return None
             return built
         if name in self._PASSTHROUGH:
             return self._PASSTHROUGH[name]
+        if root in self._PASSTHROUGH:
+            if root in self._SUBMODULE_PACKAGES:
+                try:
+                    mod = _importlib.import_module(name)
+                except Exception:
+                    return None
+                self.note('import_submodule','*',name,
+                          f'{root} 的子模块,只提供界面/工具能力')
+                return mod
+            return None
         local = self.import_local(root)
         if local is not None:
             return local
@@ -824,10 +852,57 @@ class SandBox:
             self.note('import_declared','*',name,'插件在 plugin.json 里声明的模块,不受沙盒代理')
             logging.warning('插件 %s 导入了声明放行的模块 %s(不经沙盒代理)',self.name,name)
             return mod
-        self.violation('import',f'import {name!r} 不在沙盒白名单里',name)
-        raise SandboxDenied(
-            f'import {name!r} 被插件沙盒拒绝;'
-            f'确有需要请在 plugin.json 的 sandbox.modules 里声明')
+        return None
+
+    def _attach_fromlist(self,name,obj,fromlist):
+        """from X import Y 里 Y 是子模块时,先把它挂到父模块上,否则 getattr 找不到。"""
+        root = name.split('.')[0]
+        if root not in self._SUBMODULE_PACKAGES:
+            return obj
+        for item in fromlist:
+            if not isinstance(item,str) or item == '*':
+                continue
+            try:
+                present = hasattr(obj,item)
+            except SandboxDenied:
+                present = False
+            if present:
+                continue
+            try:
+                sub = _importlib.import_module(f'{name}.{item}')
+            except Exception:
+                continue
+            real = getattr(obj,'_real',obj)
+            try:
+                setattr(real,item,sub)
+            except Exception:
+                pass
+        return obj
+
+    def import_module(self,name,globals=None,locals=None,fromlist=(),level=0):
+        if not isinstance(name,str) or not name:
+            raise SandboxDenied('import 的模块名无效')
+        if level:
+            self.violation('import','不支持相对 import',name)
+            raise SandboxDenied('沙盒里不支持相对 import')
+        obj = self._resolve_module(name)
+        if obj is None:
+            self.violation('import',f'import {name!r} 不在沙盒白名单里',name)
+            raise SandboxDenied(
+                f'import {name!r} 被插件沙盒拒绝;'
+                f'确有需要请在 plugin.json 的 sandbox.modules 里声明')
+        if fromlist:
+            # from X import a,b:补上子模块,剩下的交给 import 机制去 getattr
+            return self._attach_fromlist(name,obj,fromlist)
+        # __import__ 的契约:没有 fromlist 的 "import a.b" 必须返回**顶层** a,
+        # 这样字节码把 a 绑到名字上之后,a.b 仍能按属性取到。
+        # 这里原来直接返回了 a.b,于是 `import tkinter.simpledialog` 会把
+        # tkinter 绑成子模块,之后 tkinter.simpledialog.xxx 全都炸 —— 就是这个 bug。
+        top = name.split('.')[0]
+        if top == name:
+            return obj
+        topobj = self._resolve_module(top)
+        return obj if topobj is None else topobj
 
     def import_local(self,name):
         """插件自己目录里的模块:用沙盒命名空间执行,不能借它拿到真 os。"""
@@ -955,6 +1030,8 @@ class env_box:
     命名空间一旦被删(plugin/nb/a.py 就试过 del pro.env_dict.a['2']),宿主手里的
     SandBox 对象仍然有效,get()/create() 会按需把它重新登记回来。
     """
+    #只能防老实的插件
+    #陌生插件还是发给gpt吧
 
     def __init__(self):
         self.a = {}
@@ -1267,7 +1344,8 @@ def _audit_target(event,args):
 
 def _audit_hook(event,args):
     """进程级审计钩子:插件绕开沙盒门面(内省拿真模块)时,这里兜底。"""
-    if getattr(_FRAME_LOCAL,'depth',0):
+    if getattr(_FRAME_LOCAL,'depth',0) and __name__ !="__main__":
+        
         return                                  # 门面/宿主自己发起,权限已查过
     _facade_enter()
     try:
@@ -1316,3 +1394,39 @@ def install_audit_hook():
 _ALWAYS_READABLE = tuple(_norm(p) for p in
                          (sys.prefix,sys.base_prefix,os.path.dirname(os.__file__))
                          if p)
+if __name__ == "__main__":
+    env = env_box()
+    env_id = 'main'
+    m = input('file path:')
+    if not os.path.isfile(m):
+        exit(1)
+    cm = open(m,'r',encoding='utf-8').read()
+    b = parse_policy(None,[],'.')
+    box = env.create(env_id,'main','.',
+                            b,
+                            _host_token=_HOST_TOKEN)
+    d = box.namespace
+    for w in b.warnings:
+        print(f'[沙盒] {"."}:{w}')
+    
+    
+
+    try:
+    
+        # 先编译:语法错误在这里就能拿到,不用等回调里再炸
+        code = compile(cm,f'<file main>','exec')
+    except Exception as e:
+        logging.exception('编译插件 init 代码失败')
+    install_audit_hook()
+    try:
+    
+        exec(code,d)
+    except SandboxDenied as e:
+        # 被沙盒挡下属于"预期内"的结果:一行干净提示,不吓人
+        logging.warning('文件 的 init 被沙盒拦截:%s',e)
+        print(f'[沙盒] 文件的 init 被拦截:{e}')
+    except Exception as e:
+        logging.exception('执行 代码失败')
+        print(f'文件错误:{e}')
+        traceback.print_exc()
+    

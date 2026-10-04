@@ -350,7 +350,6 @@ def t_net_proc():
 def t_import():
     box, d = make_box('imp')
     assert box.import_module('json') is json
-    assert box.import_module('tkinter.simpledialog') is sys.modules['tkinter.simpledialog']
     assert box.import_module('os') is box.module_builders()['os']
     for name in ('ctypes', 'shutil', 'importlib', 'pickle', 'vlc', 'b', 'numpy'):
         try:
@@ -370,6 +369,51 @@ def t_import():
     # 声明放行的模块不受门面代理(装载时会打印警告)
     ok, d2 = make_box('imp2', {'modules': ['xml']})
     assert ok.import_module('xml') is sys.modules['xml']
+
+
+@test
+def t_import_dotted():
+    """__import__ 的契约:没有 fromlist 的 "import a.b" 必须返回顶层包 a。
+
+    这条是回归测试:以前直接返回子模块,于是 `import tkinter.simpledialog`
+    会把 tkinter 绑成子模块,之后 tkinter.simpledialog.xxx 全部炸掉
+    (真实插件就是这么报的 AttributeError)。
+    """
+    import tkinter
+    import tkinter.simpledialog as sd
+    box, d = make_box('impdot')
+
+    assert box.import_module('tkinter.simpledialog') is tkinter, '必须返回顶层包'
+    assert box.import_module('tkinter.simpledialog', fromlist=('askstring',)) is sd
+    assert box.import_module('os.path') is box.module_builders()['os']
+    assert hasattr(box.module_builders()['os'], 'path')
+
+    ns = box.namespace
+    tag = box.frame_tag + 'init>'
+    # 插件里最常见的写法:import a.b 之后用 a.b.x
+    exec(compile('import tkinter.simpledialog\n'
+                 'assert tkinter is not None\n'
+                 '_cls = tkinter.simpledialog.SimpleDialog\n'
+                 '_fn = tkinter.simpledialog.askstring\n',
+                 tag, 'exec'), ns)
+    assert ns['tkinter'] is tkinter, 'import tkinter.simpledialog 之后 tkinter 必须还是包'
+    assert ns['_cls'] is sd.SimpleDialog and ns['_fn'] is sd.askstring
+
+    # from X import Y(Y 是子模块)也要能拿到
+    exec(compile('from tkinter import simpledialog as _sub\n'
+                 'from tkinter import ttk as _ttk\n',
+                 tag, 'exec'), ns)
+    assert ns['_sub'] is sd
+    assert ns['_ttk'] is tkinter.ttk
+
+    # 没在白名单里的包,子模块照样拒
+    for name in ('os.environ.x', 'shutil.os', 'ctypes.util'):
+        try:
+            box.import_module(name)
+        except ps.SandboxDenied:
+            pass
+        else:
+            raise AssertionError(f'import {name} 竟然被放行')
 
 
 @test
