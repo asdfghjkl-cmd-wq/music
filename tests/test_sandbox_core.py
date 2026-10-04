@@ -497,9 +497,9 @@ def t_escape_fixture():
         raise AssertionError(f'逃逸样本以意外方式失败:{type(e).__name__}: {e}')
     else:
         raise AssertionError('逃逸样本竟然跑完了(os.sys.exit 之类的都没被拦?)')
-    assert any('给自己授权' in e['detail'] or 'import' in e['detail'] or
-               '能力' in e['detail'] or '禁用' in e['detail'] or '白名单' in e['detail']
-               for e in box.events), box.events
+    # 这份样本现在是在 HostFacade 那一层就撞墙了(pro.env_dict 直接不给),
+    # 所以断言放宽成:必须留下一条拦截记录。
+    assert any(e['action'].startswith('violation') for e in box.events), box.events
     # 注册表被删掉的命名空间应当能自我修复,且宿主手里的对象不受影响
     assert registry.a.get(1) is not None
     del registry.a[1]

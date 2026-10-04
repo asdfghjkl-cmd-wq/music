@@ -19,23 +19,317 @@ except ModuleNotFoundError:
     logging.warning('mutagen不存在,无法加载音乐信息')
     start_music_message = False
 
+class Config:
+
+    DEFAULT = {'theme': 'solarized-light', 'exit_way': 0,'allow_plugin':[],
+               'plugin_unsafe':[],'plugin_grants':{},'start_plugin':True,'start_sandbox':False}
+
+    @classmethod
+    def _default(cls,key):
+        """取默认值的副本,避免 DEFAULT 里的可变对象(如白名单列表)被泄漏出去后就地改写"""
+        return copy.deepcopy(cls.DEFAULT[key])
+
+    def __init__(self):
+        self.path = os.path.join(BASE_DIR,'config.json')
+        self._dict = copy.deepcopy(self.DEFAULT)
+        self.theme = self._default('theme')
+        self.exit_way = self._default('exit_way')
+        self.allow_plugin = self._default('allow_plugin')
+        self.plugin_unsafe = self._default('plugin_unsafe')
+        self.plugin_grants = self._default('plugin_grants')
+        self.start_plugin = self._default('start_plugin')
+        self.start_sandbox = self._default('start_sandbox')
+        self.load()
+    
+    def load(self):
+        # 先把可变状态复位:同一个 Config 对象二次 load(或换了文件)时,
+        # 文件里缺的字段必须回到默认值,而不是留着上一次读到的内容
+        self.theme = self._default('theme')
+        self.exit_way = self._default('exit_way')
+        self.allow_plugin = self._default('allow_plugin')
+        self.plugin_unsafe = self._default('plugin_unsafe')
+        self.plugin_grants = self._default('plugin_grants')
+        self.start_plugin = self._default('start_plugin')
+        self.start_sandbox = self._default('start_sandbox')
+        try:
+            with open(self.path,'r',encoding='utf-8') as fp:
+                n = json.load(fp)
+        except FileNotFoundError:
+            n = {}                      
+        except (OSError,UnicodeDecodeError,json.JSONDecodeError) as e:
+            logging.exception('读取配置文件失败,按默认配置处理')
+
+            print(f'读取 {self.path} 失败,按默认配置处理:{e}')
+            n = {}
+        if not isinstance(n,dict):
+            print(f'{self.path} 的内容不是 JSON 对象,按默认配置处理')
+            self._backup_broken_config()
+            n = {}
+        self._dict = n
+
+        t = n.get('theme',None)
+        p = n.get('allow_plugin',None)
+        if p is None:
+            # 兼容历史配置里的旧键名,避免用户的白名单被静默清空
+            for legacy in ('plugin','sussess_plugin','success_plugin'):
+                if legacy in n:
+                    print(f'{self.path} 使用了旧键 {legacy},已按 allow_plugin 处理')
+                    p = n[legacy]
+                    break
+        self.theme = t if isinstance(t,str) and t else self._default('theme')
+
+        if isinstance(p,list):
+            bad = [x for x in p if not (isinstance(x,str) and x)]
+            if bad:
+                print(f'{self.path} 里的 allow_plugin 有 {len(bad)} 个无效项,已忽略:{bad!r}')
+            # 空列表是合法值:表示不自动加载任何插件
+            self.allow_plugin = [x for x in p if isinstance(x,str) and x]
+        else:
+            if p is not None:
+                print(f'{self.path} 里的 allow_plugin 不是数组,按默认值处理')
+            self.allow_plugin = self._default('allow_plugin')
+
+        u = n.get('plugin_unsafe',None)
+        if isinstance(u,list):
+            self.plugin_unsafe = list(dict.fromkeys(x for x in u
+                                                  if isinstance(x,str) and x))
+        elif u is not None:
+            print(f'{self.path} 里的 plugin_unsafe 不是数组,按默认值处理')
+            self.plugin_unsafe = self._default('plugin_unsafe')
+        self.start_plugin = n.get('start_plugin',self._default('start_plugin'))
+        self.start_sandbox = n.get('start_sandbox',self._default('start_sandbox'))
+        if type(self.start_plugin) != bool:self.start_plugin = self._default('start_plugin')
+        if type(self.start_sandbox) != bool:self.start_sandbox = self._default('start_sandbox')
+
+        g = n.get('plugin_grants',None)
+        if isinstance(g,dict):
+            # 只收:插件名 -> {fs_read/fs_write: [路径], net/proc: true}
+            self.plugin_grants = {}
+            for who,item in g.items():
+                if not isinstance(who,str) or not who or not isinstance(item,dict):
+                    print(f'{self.path} 里的 plugin_grants {who!r} 无效,已忽略')
+                    continue
+                one = {}
+                for key in ('fs_read','fs_write'):
+                    v = item.get(key,None)
+                    if v is None:
+                        continue
+                    if isinstance(v,str):
+                        v = [v]
+                    if not isinstance(v,list):
+                        print(f'{self.path} 里 {who} 的 {key} 不是数组,已忽略')
+                        continue
+                    paths = []
+                    for p in v:
+                        if isinstance(p,str) and p.strip():
+                            paths.append(os.path.normpath(p))
+                        else:
+                            print(f'{self.path} 里 {who} 的 {key} 有无效项 {p!r},已忽略')
+                    if paths:
+                        one[key] = paths
+                for key in ('net','proc'):
+                    v = item.get(key,None)
+                    if v is None:
+                        continue
+                    if not isinstance(v,bool):
+                        print(f'{self.path} 里 {who} 的 {key} 不是布尔值,已忽略')
+                        continue
+                    if v:
+                        one[key] = True
+                if one:
+                    self.plugin_grants[who] = one
+        elif g is not None:
+            print(f'{self.path} 里的 plugin_grants 不是对象,按默认值处理')
+            self.plugin_grants = self._default('plugin_grants')
+
+        try:
+            self.exit_way = int(n.get('exit_way',self._default('exit_way')))
+        except (TypeError,ValueError):
+            logging.exception('解析配置项 exit_way 失败')
+            print(f'{self.path} 里的 exit_way 不是数字,按默认值处理')
+            self.exit_way = self._default('exit_way')
+        if self.exit_way not in (0,1,2):
+            print(f'{self.path} 里的 exit_way={self.exit_way} 已失效,按默认值处理')
+            self.exit_way = self._default('exit_way')
+
+    def grants_for(self,name):
+        """把 config 里记住的授权摊平成 (能力,目标) 列表,装载时喂回沙盒。"""
+        g = self.plugin_grants.get(name) or {}
+        out = []
+        for p in g.get('fs_read',()) or ():
+            out.append(('fs:read',p))
+        for p in g.get('fs_write',()) or ():
+            out.append(('fs:write',p))
+        if g.get('net'):
+            out.append(('net',None))
+        if g.get('proc'):
+            out.append(('proc',None))
+        return out
+
+    def grant(self,name,cap,target=None):
+        """记一条授权:插件运行期点"总是允许"时由播放器调用,随后由 save() 落盘。"""
+        g = self.plugin_grants.setdefault(name,{})
+        if cap in ('fs:read','fs:write'):
+            key = 'fs_read' if cap == 'fs:read' else 'fs_write'
+            if not target:
+                return g
+            # 沙盒的白名单是"目录级"的:这里归一成真正生效的目录,
+            # 免得 config.json 里记着一个文件路径、实际放开的却是整个目录
+            target = os.path.normpath(os.path.abspath(target))
+            if not os.path.isdir(target):
+                target = os.path.dirname(target) or target
+            g.setdefault(key,[])
+            if target not in g[key]:
+                g[key].append(target)
+        elif cap in ('net','proc'):
+            g[cap] = True
+        return g
+
+    def _backup_broken_config(self):
+        """把无法解析的配置挪到带时间戳的 .bak,备份失败也不影响启动。
+
+        原来这里直接 os.rename(path, path+".bak") 而且没有 try:
+        Windows 上 .bak 已存在会抛 FileExistsError,又没人接住,
+        结果是坏配置让程序启动即崩。os.replace 覆盖同名文件,不挑平台。
+        """
+        dst = f'{self.path}.{time.strftime("%Y%m%d-%H%M%S")}.bak'
+        try:
+            os.replace(self.path,dst)
+        except OSError as e:
+            logging.exception('备份配置文件失败,忽略')
+            print(f'备份 {self.path} 失败(忽略):{e}')
+
+    def save(self):
+        # 清掉已经迁移过的旧键,免得它们一直留在配置文件里
+        for legacy in ('plugin','sussess_plugin','success_plugin'):
+            self._dict.pop(legacy,None)
+        self._dict['theme'] = self.theme
+        self._dict['exit_way'] = self.exit_way
+        self._dict['allow_plugin'] = self.allow_plugin
+        self._dict['plugin_unsafe'] = self.plugin_unsafe
+        self._dict['plugin_grants'] = self.plugin_grants
+        self._dict['start_sandbox'] = self.start_sandbox
+        self._dict['start_plugin'] = self.start_plugin
+
+        tmp = self.path + '.tmp'
+        try:
+            with open(tmp,'w',encoding='utf-8') as fp:
+                json.dump(self._dict,fp,ensure_ascii=False)
+            os.replace(tmp,self.path)
+        except OSError as e:
+            logging.exception('保存配置文件失败')
+            print(f'保存 {self.path} 失败:{e}')
 
 
-start_plugin = True
+start_plugin = Config().start_plugin
+start_sandbox = Config().start_sandbox
 # 插件沙盒:能力模型、路径判定、封存与审计都在 plugin_sandbox.py 里。
 # env_box 由它提供,替代原先那个把 b.py 的 globals() 整个暴露给插件的实现。
-try:
-    from plugin_sandbox import (env_box, parse_policy, SandboxDenied, _HOST_TOKEN,
-                            ASK_YES, ASK_SESSION, ASK_ALWAYS, install_audit_hook)
-except ModuleNotFoundError:
-    traceback.print_exc()
-    logging.warning('plugin_sandbox文件不存在,无法加载插件')
-    start_plugin = False
+
+if start_plugin and start_sandbox:
+    try:
+        from plugin_sandbox import (env_box, parse_policy, SandboxDenied, _HOST_TOKEN,
+                                ASK_YES, ASK_SESSION, ASK_ALWAYS, install_audit_hook)
+    except ModuleNotFoundError:
+        traceback.print_exc()
+        logging.warning('plugin_sandbox文件不存在,无法加载插件')
+        start_plugin = False
 
 
 
 NO_FILE = 'no<>found*.mp3*.mp4..'
 
+class Plugin_no_sandbox:
+    def __init__(self,dir:str):
+
+        self.plugin_file_path = os.path.join(dir,'plugin.json')
+        n = {}
+        try:
+            with open(self.plugin_file_path,'r',encoding='utf-8') as fp:
+                n = json.load(fp)
+        except Exception as e:
+            print(f'读取 {self.plugin_file_path} 失败,按空配置处理:{e}')
+        if not isinstance(n,dict):
+            print(f'{self.plugin_file_path} 的内容不是 JSON 对象,按空配置处理')
+            n = {}
+        
+        self.init = n.get('init','').replace('from b import *','',1)
+        init_file = n.get('init_file','')
+        if init_file:
+            try:
+                with open(os.path.join(dir,init_file),'r',encoding="utf-8") as fp:
+                    self.init = fp.read().replace('from b import *','',1)
+            except Exception as e:
+                print(f'读取 {init_file} 失败,忽略:{e}')
+
+        self.command = n.get('command','')
+        command_file = n.get('command_file','')
+        if command_file:
+            try:
+                with open(os.path.join(dir,command_file),'r',encoding="utf-8") as fp:
+                    self.command = fp.read()
+            except Exception as e:
+                print(f'读取 {command_file} 失败,忽略:{e}')
+
+        self.init_ok = False
+        
+        self.com = None
+
+        self.name = n.get('name','')
+        self.can_exec = n.get('can_exec',False)
+        self.exec_path = n.get('exec_path',[])
+        self.env_id = n.get('env_id','')
+        
+    def init_env(self,env_dict:dict):
+        self.env_dict = env_dict.get(self.env_id,dict(globals()))
+        self.env_dict['__env_id__']  = self.env_id
+        self.env_dict['__start_sandbox__'] = start_sandbox
+        env_dict[self.env_id] =self.env_dict
+
+
+        
+    def init_i(self,tkaapp):
+        self.env_dict['pro'] = tkaapp
+        
+        if not self.can_exec or self.init_ok:
+            return
+        self.init_ok = True
+        try:
+            # 先编译:语法错误在这里就能拿到,不用等回调里再炸
+            code = compile(self.init,f'<plugin {self.name} init>','exec')
+        except Exception as e:
+            print(f'插件 {self.name} 的 init 代码无法编译,已跳过:{e}')
+            return
+        def _run_init():
+            # 插件代码出问题只应该影响它自己,不能把整个播放器带崩
+            try:
+                exec(code,self.env_dict)
+            except Exception as e:
+                print(f'插件 {self.name} 初始化失败:{e}')
+                traceback.print_exc()
+        tkaapp.app.after(0,_run_init)
+
+
+    def run(self,tkaapp=None):
+        if not self.can_exec or tkaapp is None:
+            return
+        self.env_dict['pro'] = tkaapp
+        if not self.com:
+            try:
+                self.com = compile(self.command,f'<plugin {self.name} command>','exec')
+            except Exception as e:
+                print(f'插件 {self.name} 的 command 无法编译,已跳过:{e}')
+                return
+        
+        
+        
+        def _run_command():
+            try:
+                exec(self.com,self.env_dict)
+            except Exception as e:
+                print(f'插件 {self.name} 执行失败:{e}')
+                traceback.print_exc()
+        tkaapp.app.after(0,_run_command)
 
 class Player:
     def __init__(self,d:dict): 
@@ -602,7 +896,7 @@ class SeekBar(ttkbootstrap.Frame):
 
 
 class Plugin:
-    def __init__(self,dir:str,env_dict,other_names=None):
+    def __init__(self,dir:str,env_dict:env_box,other_names=None):
         self.env_dict = env_dict
         self.plugin_file_path = os.path.join(dir,'plugin.json')
         n = {}
@@ -698,6 +992,7 @@ class Plugin:
                                          self.sandbox_policy,
                                          _host_token=_HOST_TOKEN)
         self._env_dict = self._box.namespace
+        self._env_dict['__start_sandbox__'] = start_sandbox
 
         
     def init_i(self,tkaapp):
@@ -761,196 +1056,7 @@ class Plugin:
 
 
 
-class Config:
 
-    DEFAULT = {'theme': 'solarized-light', 'exit_way': 0,'allow_plugin':[],
-               'plugin_unsafe':[],'plugin_grants':{}}
-
-    @classmethod
-    def _default(cls,key):
-        """取默认值的副本,避免 DEFAULT 里的可变对象(如白名单列表)被泄漏出去后就地改写"""
-        return copy.deepcopy(cls.DEFAULT[key])
-
-    def __init__(self):
-        self.path = os.path.join(BASE_DIR,'config.json')
-        self._dict = copy.deepcopy(self.DEFAULT)
-        self.theme = self._default('theme')
-        self.exit_way = self._default('exit_way')
-        self.allow_plugin = self._default('allow_plugin')
-        self.plugin_unsafe = self._default('plugin_unsafe')
-        self.plugin_grants = self._default('plugin_grants')
-        self.load()
-    
-    def load(self):
-        # 先把可变状态复位:同一个 Config 对象二次 load(或换了文件)时,
-        # 文件里缺的字段必须回到默认值,而不是留着上一次读到的内容
-        self.theme = self._default('theme')
-        self.exit_way = self._default('exit_way')
-        self.allow_plugin = self._default('allow_plugin')
-        self.plugin_unsafe = self._default('plugin_unsafe')
-        self.plugin_grants = self._default('plugin_grants')
-        try:
-            with open(self.path,'r',encoding='utf-8') as fp:
-                n = json.load(fp)
-        except FileNotFoundError:
-            n = {}                      
-        except (OSError,UnicodeDecodeError,json.JSONDecodeError) as e:
-            logging.exception('读取配置文件失败,按默认配置处理')
-
-            print(f'读取 {self.path} 失败,按默认配置处理:{e}')
-            n = {}
-        if not isinstance(n,dict):
-            print(f'{self.path} 的内容不是 JSON 对象,按默认配置处理')
-            self._backup_broken_config()
-            n = {}
-        self._dict = n
-
-        t = n.get('theme',None)
-        p = n.get('allow_plugin',None)
-        if p is None:
-            # 兼容历史配置里的旧键名,避免用户的白名单被静默清空
-            for legacy in ('plugin','sussess_plugin','success_plugin'):
-                if legacy in n:
-                    print(f'{self.path} 使用了旧键 {legacy},已按 allow_plugin 处理')
-                    p = n[legacy]
-                    break
-        self.theme = t if isinstance(t,str) and t else self._default('theme')
-
-        if isinstance(p,list):
-            bad = [x for x in p if not (isinstance(x,str) and x)]
-            if bad:
-                print(f'{self.path} 里的 allow_plugin 有 {len(bad)} 个无效项,已忽略:{bad!r}')
-            # 空列表是合法值:表示不自动加载任何插件
-            self.allow_plugin = [x for x in p if isinstance(x,str) and x]
-        else:
-            if p is not None:
-                print(f'{self.path} 里的 allow_plugin 不是数组,按默认值处理')
-            self.allow_plugin = self._default('allow_plugin')
-
-        u = n.get('plugin_unsafe',None)
-        if isinstance(u,list):
-            self.plugin_unsafe = list(dict.fromkeys(x for x in u
-                                                  if isinstance(x,str) and x))
-        elif u is not None:
-            print(f'{self.path} 里的 plugin_unsafe 不是数组,按默认值处理')
-            self.plugin_unsafe = self._default('plugin_unsafe')
-
-        g = n.get('plugin_grants',None)
-        if isinstance(g,dict):
-            # 只收:插件名 -> {fs_read/fs_write: [路径], net/proc: true}
-            self.plugin_grants = {}
-            for who,item in g.items():
-                if not isinstance(who,str) or not who or not isinstance(item,dict):
-                    print(f'{self.path} 里的 plugin_grants {who!r} 无效,已忽略')
-                    continue
-                one = {}
-                for key in ('fs_read','fs_write'):
-                    v = item.get(key,None)
-                    if v is None:
-                        continue
-                    if isinstance(v,str):
-                        v = [v]
-                    if not isinstance(v,list):
-                        print(f'{self.path} 里 {who} 的 {key} 不是数组,已忽略')
-                        continue
-                    paths = []
-                    for p in v:
-                        if isinstance(p,str) and p.strip():
-                            paths.append(os.path.normpath(p))
-                        else:
-                            print(f'{self.path} 里 {who} 的 {key} 有无效项 {p!r},已忽略')
-                    if paths:
-                        one[key] = paths
-                for key in ('net','proc'):
-                    v = item.get(key,None)
-                    if v is None:
-                        continue
-                    if not isinstance(v,bool):
-                        print(f'{self.path} 里 {who} 的 {key} 不是布尔值,已忽略')
-                        continue
-                    if v:
-                        one[key] = True
-                if one:
-                    self.plugin_grants[who] = one
-        elif g is not None:
-            print(f'{self.path} 里的 plugin_grants 不是对象,按默认值处理')
-            self.plugin_grants = self._default('plugin_grants')
-
-        try:
-            self.exit_way = int(n.get('exit_way',self._default('exit_way')))
-        except (TypeError,ValueError):
-            logging.exception('解析配置项 exit_way 失败')
-            print(f'{self.path} 里的 exit_way 不是数字,按默认值处理')
-            self.exit_way = self._default('exit_way')
-        if self.exit_way not in (0,1,2):
-            print(f'{self.path} 里的 exit_way={self.exit_way} 已失效,按默认值处理')
-            self.exit_way = self._default('exit_way')
-
-    def grants_for(self,name):
-        """把 config 里记住的授权摊平成 (能力,目标) 列表,装载时喂回沙盒。"""
-        g = self.plugin_grants.get(name) or {}
-        out = []
-        for p in g.get('fs_read',()) or ():
-            out.append(('fs:read',p))
-        for p in g.get('fs_write',()) or ():
-            out.append(('fs:write',p))
-        if g.get('net'):
-            out.append(('net',None))
-        if g.get('proc'):
-            out.append(('proc',None))
-        return out
-
-    def grant(self,name,cap,target=None):
-        """记一条授权:插件运行期点"总是允许"时由播放器调用,随后由 save() 落盘。"""
-        g = self.plugin_grants.setdefault(name,{})
-        if cap in ('fs:read','fs:write'):
-            key = 'fs_read' if cap == 'fs:read' else 'fs_write'
-            if not target:
-                return g
-            # 沙盒的白名单是"目录级"的:这里归一成真正生效的目录,
-            # 免得 config.json 里记着一个文件路径、实际放开的却是整个目录
-            target = os.path.normpath(os.path.abspath(target))
-            if not os.path.isdir(target):
-                target = os.path.dirname(target) or target
-            g.setdefault(key,[])
-            if target not in g[key]:
-                g[key].append(target)
-        elif cap in ('net','proc'):
-            g[cap] = True
-        return g
-
-    def _backup_broken_config(self):
-        """把无法解析的配置挪到带时间戳的 .bak,备份失败也不影响启动。
-
-        原来这里直接 os.rename(path, path+".bak") 而且没有 try:
-        Windows 上 .bak 已存在会抛 FileExistsError,又没人接住,
-        结果是坏配置让程序启动即崩。os.replace 覆盖同名文件,不挑平台。
-        """
-        dst = f'{self.path}.{time.strftime("%Y%m%d-%H%M%S")}.bak'
-        try:
-            os.replace(self.path,dst)
-        except OSError as e:
-            logging.exception('备份配置文件失败,忽略')
-            print(f'备份 {self.path} 失败(忽略):{e}')
-
-    def save(self):
-        # 清掉已经迁移过的旧键,免得它们一直留在配置文件里
-        for legacy in ('plugin','sussess_plugin','success_plugin'):
-            self._dict.pop(legacy,None)
-        self._dict['theme'] = self.theme
-        self._dict['exit_way'] = self.exit_way
-        self._dict['allow_plugin'] = self.allow_plugin
-        self._dict['plugin_unsafe'] = self.plugin_unsafe
-        self._dict['plugin_grants'] = self.plugin_grants
-
-        tmp = self.path + '.tmp'
-        try:
-            with open(tmp,'w',encoding='utf-8') as fp:
-                json.dump(self._dict,fp,ensure_ascii=False)
-            os.replace(tmp,self.path)
-        except OSError as e:
-            logging.exception('保存配置文件失败')
-            print(f'保存 {self.path} 失败:{e}')
 
 
 class Tkapp:
@@ -998,6 +1104,8 @@ class Tkapp:
         
         self._ui_queue: "queue.Queue" = queue.Queue()
         self.icon_menu =  pystray.Menu(pystray.MenuItem('显示主界面',lambda:self._ui_queue.put('show'),default=True),
+                                       pystray.MenuItem('播放',lambda:self._ui_queue.put('play')),
+                                       pystray.MenuItem('暂停',lambda:self._ui_queue.put('pause')),
                                        pystray.MenuItem('退出',lambda:self._ui_queue.put('quit'))
                                        )
         self.backround_icon = pystray.Icon('music',self.raw_image_obj,'music player',self.icon_menu)
@@ -1077,14 +1185,15 @@ class Tkapp:
         self.app.bind('<Left>',self.time_minus_ten)
         self.app.bind('<Right>',self.time_add_ten)
         self.app.bind("<Configure>", self.on_resize)
-        if start_plugin:
+        if start_plugin and start_sandbox:
             self.env_dict = env_box()
 
 
         self.menu.add_command(label='重加载音乐列表',command=self.flush_music)
-
+        self.menu.add_command(label='插件管理',command=self.plugin_setting)
         self.menu.add_command(label='设置',command=self.setting)
-        
+
+        self.env__dict = dict()
         
         self.app.config(menu=self.menu)
 
@@ -1105,12 +1214,27 @@ class Tkapp:
         # 插件的名字"。Plugin 用它给自己声明的 name 消歧:同名插件会被改名,
         # 于是不会共用一份 env 命名空间(env_id 默认就等于 name)。
         # 排序只是为了让改名结果稳定、可复现。
-        if start_plugin:
-            assigned_names = set()
+        assigned_names = set()
+        if start_plugin and start_sandbox:
+            
             print('[沙盒] 插件沙盒已启用:默认只允许插件读自己的目录,'
                 '写/网络/外部进程需要授权')
             print('\033[91m[warning]只能防老实的插件\n[warning]陌生插件还是发给gpt吧\033[0m',file=sys.stderr)
 
+        def load_q(n:Plugin_no_sandbox):
+            n.init_env(self.env__dict)
+            n.init_i(self)
+            self.plugin_list.append(n)
+            
+            def _bind(fn, _app=self):
+                return functools.partial(fn, _app)
+            
+            if 'play' in n.exec_path:
+                self.run_play_list.append(_bind(n.run))
+            if 'pause' in n.exec_path:
+                self.run_pause_list.append(_bind(n.run))
+            if 'listbox' in n.exec_path:
+                self.run_listbox_list.append(_bind(n.run))
         def load_p(n:Plugin):
             n.init_env()
             # 1) 把 config.json 里记住的授权喂回去(装载期、封存前)
@@ -1147,21 +1271,29 @@ class Tkapp:
                 if not os.path.isfile(os.path.join(mn,'plugin.json')):continue
                 n = None
                 try:
-                    n = Plugin(mn,self.env_dict,assigned_names)
+                    if start_sandbox:
+                        n = Plugin(mn,self.env_dict,assigned_names)
+                    else: n=Plugin_no_sandbox(mn)
+                    
                     assigned_names.add(n.name)
                     if n.name in self.config.allow_plugin:
                         # 沙盒策略在装载期一次定好(见 plugin_sandbox),插件自己改不了
-                        load_p(n)
+                        if start_sandbox:
+                            load_p(n)
+                        else:load_q(n)
                     else:
-                        ask = (f'是否加载 {n.name}\n\n它申请的权限:\n'
+                        if start_sandbox:
+                            ask = (f'是否加载 {n.name}\n\n它申请的权限:\n'
                                f'{n.sandbox_policy.describe()}')
+                        else:ask =f'是否加载 {n.name}'
+
                         if ttkbootstrap.Messagebox.yesno(ask,title='插件',
                                                          parent=self.app,buttons=['是','否']) == '是':
                             if ttkbootstrap.Messagebox.yesno('是否默认加载',title='插件',
                                                              parent=self.app,buttons=['是','否']) == '是':
                                 self.config.allow_plugin.append(n.name)
-
-                            load_p(n)
+                            if start_sandbox:load_p(n)
+                            else:load_q(n)
                 except Exception as e:
                     logging.exception('加载插件失败')
                     # 单个插件出问题不该把整个播放器带崩
@@ -1172,7 +1304,7 @@ class Tkapp:
         # 装载到此结束。插件的 init/command 都是 app.after 投递的,要等 mainloop
         # 才开始跑,所以上面这些装载逻辑一定先于任何插件代码执行。
         # 封存沙盒:策略从此冻结,连宿主都不能再改,插件更不可能给自己加权限。
-        if start_plugin:
+        if start_plugin and start_sandbox:
             self.env_dict.seal()
 
 
@@ -1242,7 +1374,20 @@ class Tkapp:
         else:self.volume_var.set(n+10);self.player.set_volume(n+10);self.music_label.config(text=f"音量:{n+10}")
 
         return 'break'
-
+    def plugin_setting(self):
+        ui = ttkbootstrap.Toplevel('plugin setting',size=(200,250))
+        n = tkinter.BooleanVar(value=self.config.start_plugin)
+        f = tkinter.BooleanVar(value=self.config.start_sandbox)
+        a=ttkbootstrap.Checkbutton(ui,text='启用插件',variable=n,onvalue=True,offvalue=False)
+        p=ttkbootstrap.Checkbutton(ui,text='启用沙盒',variable=f,onvalue=True,offvalue=False)
+        a.pack()
+        p.pack()
+        def save():
+            self.config.start_plugin = n.get()
+            self.config.start_sandbox = f.get() 
+            self.config.save()
+            ui.destroy()
+        ttkbootstrap.Button(ui,text="保存",command=save).pack()
     def _pump_ui(self):
 
         try:
@@ -1250,6 +1395,10 @@ class Tkapp:
                 cmd = self._ui_queue.get_nowait()
                 if cmd == 'show':
                     self.app.deiconify()
+                elif cmd == 'play':
+                    self.play()
+                elif cmd == 'pause':
+                    self.pause()
                 elif cmd == 'quit':
                     self.cleanup_and_exit()
                     return              
@@ -1584,19 +1733,21 @@ class Tkapp:
 def main():
     # 只在真正启动播放器时配置日志:本文件也会被插件 import,
     # 那时候不该去动调用方的 logging 配置。
-    logging.basicConfig(level=logging.INFO,
+    logging.basicConfig(level=logging.DEBUG,
                         filename=os.path.join(BASE_DIR,'music.log'),
                         encoding='utf-8',
                         format='%(asctime)s %(levelname)s [%(threadName)s] %(message)s')
 
     # 审计钩子:插件绕开沙盒门面(内省拿到真 os/socket)时的第二道闸
-    if start_plugin:
+    if start_plugin and start_sandbox:
         if install_audit_hook():
             print('[沙盒] 审计钩子已安装:绕开门面的文件/网络/进程访问同样会被拦')
 
     pro = Tkapp()
     pro.app.focus_get()
     pro.run()
+
+    
 
 pro:Tkapp
 __env_id__:str

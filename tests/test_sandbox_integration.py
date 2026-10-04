@@ -83,18 +83,25 @@ def t_wired():
     assert not hasattr(b, 'SandBox'), '不是重点,只是提醒'
     reg, host, plugins = load_all()
     names = sorted(p.name for p in plugins)
-    assert names == ['debug', 'exit_add', 'test', 'test_1', 'test_2'], names
+    # 这份清单跟着 plugin/ 目录走:新增一个会被装载的插件,这里要一起加。
+    # (plugin/escape 是越权样本/PoC,can_exec:true 所以它也在这里;
+    #  plugin/escape2 是第三批"模块 globals"越权样本,同样 can_exec:true)
+    assert names == ['debug', 'exit_add', 'sandbox_escape', 'sandbox_escape2',
+                     'test', 'test_1', 'test_2'], names
     assert reg.is_sealed(), '装载结束必须封存'
-    assert len(reg.boxes()) == 4, [x.env_id for x in reg.boxes()]     # test/test_1 共用 env 1
+    assert len(reg.boxes()) == 6, [x.env_id for x in reg.boxes()]     # test/test_1 共用 env 1
 
 
 @test
 def t_existing_plugins_still_work():
     reg, host, plugins = load_all()
     by = {p.name: p for p in plugins}
-    # 两个有 GUI 动作的插件照常在 init 里注册菜单
-    assert [c['label'] for c in host.menu.commands] == ['debug', 'exit'], host.menu.commands
-    assert callable(host.menu.commands[0]['command'])
+    # 两个有 GUI 动作的插件照常在 init 里注册菜单(按 label 找,不写死顺序:
+    # plugin/escape 也会挂它自己的菜单项)
+    labels = [c['label'] for c in host.menu.commands]
+    assert 'debug' in labels and 'exit' in labels, labels
+    debug_cmd = next(c['command'] for c in host.menu.commands if c['label'] == 'debug')
+    assert callable(debug_cmd)
     # 共用 env_id=1 的 test / test_1:一个写 a=64,另一个的命令 print(a) 看得到
     assert by['test']._env_dict['a'] == 64
     assert by['test']._box is by['test_1']._box, '共用 env_id 应当是同一个沙盒'
@@ -113,7 +120,7 @@ def t_existing_plugins_still_work():
     buf2, old2 = io.StringIO(), sys.stdout
     sys.stdout = buf2
     try:
-        host.menu.commands[0]['command']()      # debug 插件的 debug()
+        debug_cmd()                            # debug 插件的 debug()
     finally:
         sys.stdout = old2
         sd.askstring = orig_ask

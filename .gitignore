@@ -27,3 +27,4 @@ tmp*
 j.py
 __pycache__/j.cpython-313.pyc
 *.log
+dsh*

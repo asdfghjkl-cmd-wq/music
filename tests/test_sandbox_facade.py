@@ -229,6 +229,62 @@ def t_audit_respects_host_and_unsafe():
 
 
 @test
+def t_judge_entry_cannot_be_hijacked():
+    """回归:换掉判权入口/判权数据,门面和审计钩子都不能失明。
+
+    2026-10 实测过的洞(plugin/escape 第 07/08 步):
+      * `box._policy_frozen = <unsafe 快照>` —— 判权快照是实例属性,谁都能换;
+      * `box.can = lambda cap, target=None: True` —— 门面里的检查原来调
+        `self.can()`,换掉它之后门面就"自认已授权",而 `_guarded()` 又把审计
+        钩子的 depth 置 1 让它放行,于是**两道闸同时失效**。
+    现在判权只认模块私有的 `_AUTH` 记账,`__setattr__` 也拦封存后的改写。
+    """
+    box, d = make_box('hijack')
+    box.attach_host(FakePro())
+    box.seal()
+    box.namespace['real_open'] = io.open
+    outside = os.path.abspath(r'C:\Windows\win.ini')
+    outside_lit = outside.replace('\\', '\\\\')
+
+    # 封存后"改判权/审计入口"必须当场被拒
+    for name in ('can', 'violation', 'note', 'events', 'policy',
+                 '_policy_frozen', '_session', '_org'):
+        try:
+            setattr(box, name, None)
+        except ps.SandboxDenied:
+            pass
+        else:
+            raise AssertionError(f'封存后竟然能改 {name}')
+
+    # 硬来(内省 + object.__setattr__ 绕过 __setattr__)之后,判权也不能认账
+    run_tagged(box, (
+        "g = __sandbox__.can.__self__\n"
+        "snap = g.policy.snapshot()\n"
+        "object.__setattr__(snap, 'unsafe', True)\n"
+        "object.__setattr__(snap, 'fs_read', ('C:\\\\',))\n"
+        "object.__setattr__(snap, 'fs_write', ('C:\\\\',))\n"
+        "object.__setattr__(g, '_policy_frozen', snap)\n"
+        "object.__setattr__(g, 'can', lambda cap, target=None: True)\n"
+        "g._session['fs:write'].add('C:\\\\')\n"))
+    for src in (f"real_open(r'{outside_lit}')",        # 审计钩子那条路
+                f"open(r'{outside_lit}')"):            # 门面那条路
+        try:
+            run_tagged(box, src)
+        except ps.SandboxDenied:
+            pass
+        else:
+            raise AssertionError(f'换了判权入口之后竟然放行:{src}')
+    # `box.can` 这个属性确实被插件换掉了(同进程拦不住),**但没人在乎它**:
+    # 真正的判权在 `_AUTH` 记账里,门面/审计钩子读的都是那份。
+    ent = ps._AUTH[id(box)]
+    assert ent['frozen'].unsafe is False, '判权快照被插件带偏了'
+    assert ps._auth_can(ent, 'fs:read', outside) is False, '记账里的判权被带偏了'
+    assert box.can('fs:read', outside) is True, '这只是证明实例属性确实被换了(不可信)'
+    # 篡改必须留痕
+    assert any(e['action'] == 'violation:tamper' for e in box.events), box.events[-5:]
+
+
+@test
 def t_hook_install_once_and_wired():
     assert ps.install_audit_hook() is False, '钩子不该装第二遍'
     src = io.open('b.py', encoding='utf-8').read()
