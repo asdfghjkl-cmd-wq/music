@@ -1,5 +1,6 @@
 from threading import Thread
 import tkinter,io,time,random,queue,platform,os,functools,sys,copy,traceback,json,logging
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if platform.system() == 'Windows':
     os.environ['PYTHON_VLC_MODULE_PATH'] = f"{BASE_DIR}/pvlc"
@@ -228,8 +229,8 @@ start_sandbox = Config().start_sandbox
 
 if start_plugin and start_sandbox:
     try:
-        from plugin_sandbox import (env_box, parse_policy, SandboxDenied, _HOST_TOKEN,
-                                ASK_YES, ASK_SESSION, ASK_ALWAYS, install_audit_hook)
+        from plugin_sandbox.plugin_sandboxa import (env_box, parse_policy, SandboxDenied, _HOST_TOKEN,
+                                ASK_YES, ASK_SESSION, ASK_ALWAYS, install_audit_hook,SandboxView,ASK_NEVER)
     except ModuleNotFoundError:
         traceback.print_exc()
         logging.warning('plugin_sandbox文件不存在,无法加载插件')
@@ -1073,7 +1074,7 @@ class Tkapp:
         self.player = Player(self.music_dict)
         self.index: "int | None" = None     
         self.app= ttkbootstrap.Tk('music')   
-
+        
         # 这里原先有一段"Python < 3.10 就提示升级"的检查,但本文件用了 match 语句,
         # 低版本解释器在解析阶段就会 SyntaxError,那段代码永远执行不到,故删除。
         # 结论:本程序需要 Python >= 3.10,只能由启动方式/文档来保证。
@@ -1629,16 +1630,16 @@ class Tkapp:
         msg = (f'插件「{box.name}」想要{what}。\n\n'
                f'目标:{target or "(整个能力)"}\n'
                f'起因:{detail or "未说明"}\n\n'
-               '允许本次 / 本次运行都允许 / 总是允许(写进 config.json) / 拒绝')
+               '允许本次 / 本次运行都允许 / 总是允许(写进 config.json) / 不再询问(拒绝) / 拒绝 ')
         try:
             r = ttkbootstrap.Messagebox.yesno(msg,'插件请求权限',parent=self.app,
                                               buttons=['允许本次','本次运行都允许',
-                                                       '总是允许','拒绝'])
+                                                       '总是允许','不再询问','拒绝'])
         except Exception:
             logging.exception('插件权限询问失败,按拒绝处理')
             return 'no'
         return {'允许本次':ASK_YES,'本次运行都允许':ASK_SESSION,
-                '总是允许':ASK_ALWAYS}.get(r,'no')
+                '总是允许':ASK_ALWAYS,'不再询问':ASK_NEVER}.get(r,'no')
 
     def _plugin_persist(self,name,cap,target):
         """用户点了"总是允许":记进 config.json,以后装载自动生效。"""

@@ -122,6 +122,7 @@ def t_ask_mapping():
         for label, want in (('允许本次', ps.ASK_YES),
                             ('本次运行都允许', ps.ASK_SESSION),
                             ('总是允许', ps.ASK_ALWAYS),
+                            ('不再询问', ps.ASK_NEVER),
                             ('拒绝', 'no'),
                             (None, 'no')):
             answer[0] = label
@@ -131,8 +132,11 @@ def t_ask_mapping():
         restore()
     msg = calls[0]['message']
     assert 'demo' in msg and 'D:\\x\\a.txt' in msg and "open('w')" in msg, msg
+    # 第七批:多给一个"永不再问"。ttkbootstrap 拿 `buttons[-1]` 当默认按钮(回车选中),
+    # 所以"更永久的那个"要排在"拒绝"**之前**,默认才还是"拒绝"。
+    assert '不再询问' in calls[0]['buttons'], calls[0]['buttons']
+    assert len(calls[0]['buttons']) == 5, calls[0]['buttons']
     assert calls[0]['buttons'][-1] == '拒绝', calls[0]['buttons']      # 默认按钮是"拒绝"
-    assert len(calls[0]['buttons']) == 4
 
 
 @test

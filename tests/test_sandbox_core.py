@@ -256,7 +256,9 @@ def t_fs_ask():
 
     def asker(sb, cap, target, detail):
         calls.append((cap, target))
-        return answers.pop(0)
+        # 第七批之后:沙盒**每次**越权都会来问,所以答案表可能被问空;
+        # 问空之后按"拒绝"处理,免得测试被 IndexError 带偏。
+        return answers.pop(0) if answers else 'no'
     answers = ['no']
     box.set_ask(asker)
     try:
@@ -267,18 +269,39 @@ def t_fs_ask():
         raise AssertionError('用户说不该还放行')
     assert len(calls) == 1
 
-    # 同一个目标不会反复弹窗
+    # 每次越权都要重新弹窗 —— 一次拒绝不该变成永久拒绝,
+    # 否则用户再也没机会改主意(旧行为是"同一目标只问一次",已废弃)。
     try:
         box.fs_open(os.path.join(d, 'a.txt'), 'w')
     except ps.SandboxDenied:
         pass
-    assert len(calls) == 1, '同一目标重复询问'
+    assert len(calls) == 2, '同一目标第二次越权应当再问一次'
+
+    # 新增:"不再询问"才停止弹窗,并且要落盘记下来
+    box4, d4 = make_box('ask4')
+    asked4 = []
+
+    def asker4(sb, cap, target, detail):
+        asked4.append((cap, target))
+        return 'never' if len(asked4) == 1 else 'yes'
+    denied4 = []
+    box4.set_ask(asker4)
+    box4.set_persist_deny(lambda name, cap, target: denied4.append((name, cap, target)))
+    for _ in range(3):
+        try:
+            box4.fs_open(os.path.join(d4, 'n.txt'), 'w')
+        except ps.SandboxDenied:
+            pass
+    assert len(asked4) == 1, '"不再询问"之后不该再弹窗'
+    assert denied4 and denied4[0][0] == 'ask4' and denied4[0][1] == 'fs:write', \
+        '"不再询问"要调用持久化回调'
+    assert any(e['action'] == 'ask_never' for e in box4.events), '要留下审计记录'
 
     # 会话授权:这次放行,并且目录进了会话白名单
     answers = ['session']
     box.fs_open(os.path.join(d, 'b.txt'), 'w').write('1')
     assert box.can('fs:write', os.path.join(d, 'c.txt'))
-    assert len(calls) == 2
+    assert len(calls) == 3, '前两次各问了一遍,这次才轮到会话授权'
 
     # always:调用持久化回调
     seen = []
