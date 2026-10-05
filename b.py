@@ -68,6 +68,11 @@ def _default_photo():
     _DEFAULT_PHOTO_TRIED = True
     try:
         _DEFAULT_PHOTO = Image.open(os.path.join(BASE_DIR,'a.png'))
+        # B9:Image.open 只读文件头、并不解码,所以"打开成功"不等于"能用"。
+        # 真解码发生在 flush_display 的 src.resize(...),而那里没有保护 ——
+        # 一个头部合法但数据损坏的 a.png 会在切歌路径上抛,正是本函数承诺
+        # 不会发生的事。这里先强制解码一次,把坏文件在这里就降级成 None。
+        _DEFAULT_PHOTO.load()
     except Exception:
         logging.exception('打开默认封面 a.png 失败,本次按无封面处理')
         _DEFAULT_PHOTO = None
@@ -92,6 +97,9 @@ class Config:
 
     def __init__(self):
         self.path = os.path.join(BASE_DIR,'config.json')
+        # 插件目录,以及「历史旧名 -> identity」的懒加载映射(见 _identity_aliases)
+        self.plugin_dir = os.path.join(BASE_DIR,'plugin')
+        self._aliases = None
         self._dict = copy.deepcopy(self.DEFAULT)
         self.theme = self._default('theme')
         self.exit_way = self._default('exit_way')
@@ -104,7 +112,89 @@ class Config:
         self.start_sandbox = self._default('start_sandbox')
         self.load()
     
+    @staticmethod
+    def _plugin_candidates(plugin_dir):
+        """扫出 plugin/ 下每个插件目录的「候选旧名」集合 -> {候选名: identity}。
+
+        历史配置(config.json)里 allow_plugin / plugin_unsafe / plugin_grants /
+        plugin_deny / plugin_modules 的键曾是插件**自报的 name**,现在授权一律按
+        identity(目录 realpath)。不做这一步换算,老用户的白名单会在升级后整体
+        失效、每次启动重问一遍。
+
+        这里刻意**不调用** Plugin 类:Config 会在 Plugin 定义之前就被实例化
+        (模块级 _boot_config),引过去会拿到未绑定的名字。所以按同样的口径
+        重建:候选名取「目录名」与 plugin.json 里的 name;重名时依次让出
+        name (2)、name (3)……,和 Plugin.__init__ 的消歧规则保持一致。
+        """
+        out = {}
+        try:
+            names = sorted(os.listdir(plugin_dir))
+        except OSError:
+            return out
+        taken = set()
+        for entry in names:
+            full = os.path.join(plugin_dir, entry)
+            if not os.path.isdir(full):
+                continue
+            declared = ''
+            try:
+                with open(os.path.join(full, 'plugin.json'), 'r', encoding='utf-8') as fp:
+                    manifest = json.load(fp)
+                if isinstance(manifest, dict):
+                    raw = manifest.get('name', '')
+                    if isinstance(raw, str) and raw:
+                        declared = raw
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                declared = ''
+            base = declared or os.path.basename(os.path.normpath(full))
+            final, i = base, 2
+            while final in taken:
+                final = f'{base} ({i})'
+                i += 1
+            taken.add(final)
+            ident = os.path.normcase(os.path.realpath(full))
+            for cand in (base, final, os.path.basename(os.path.normpath(full))):
+                if cand:
+                    out.setdefault(cand, ident)
+        return out
+
+    def _identity_aliases(self):
+        if self._aliases is None:
+            self._aliases = self._plugin_candidates(
+                self.plugin_dir or os.path.join(BASE_DIR, 'plugin'))
+        return self._aliases
+
+    def _migrate_who(self, who):
+        """把历史配置里的插件名换算成 identity;换算不了就原样返回。
+
+        已经是 identity 的值会如实命中 _plugin_candidates 里同一个目录,
+        于是换算后与自身相等,不会破坏现有(已是路径的)配置。
+        """
+        if not isinstance(who, str) or not who:
+            return who
+        return self._identity_aliases().get(who, who)
+
+    def _migrate_value(self, value):
+        """数组类配置项(allow_plugin / plugin_unsafe)的逐项换算 + 去重。
+
+        换算不出来的项**保持原样**:它可能是已经卸载的插件(历史上被允许过),
+        留着既不影响判定,也不会因为一次读盘就把用户的历史记录抹掉。
+        """
+        if not isinstance(value, list):
+            return value
+        out = []
+        for item in value:
+            if not isinstance(item, str) or not item:
+                continue
+            got = self._identity_aliases().get(item, item)
+            if got not in out:
+                out.append(got)
+        return out
+
     def load(self):
+        # 每次(重新)装载都重扫一次插件目录,别让上一次的旧名->identity 映射
+        # 残留到已经变了的磁盘状态上
+        self._aliases = None
         # 先把可变状态复位:同一个 Config 对象二次 load(或换了文件)时,
         # 文件里缺的字段必须回到默认值,而不是留着上一次读到的内容
         self.theme = self._default('theme')
@@ -149,9 +239,11 @@ class Config:
             bad = [x for x in p if not (isinstance(x,str) and x)]
             if bad:
                 print(f'{self.path} 里的 allow_plugin 有 {len(bad)} 个无效项,已忽略:{bad!r}')
-            # 空列表是合法值:表示不自动加载任何插件
-            self.allow_plugin = list(dict.fromkeys(x for x in p
-                                                   if isinstance(x,str) and x))
+            # 空列表是合法值:表示不自动加载任何插件。
+            # L16:逐项把历史配置里的「插件名」换算成 identity —— 授权键早已
+            # 改成目录 realpath(H1:自报 name 不能再决定授权归属),但 config 里
+            # 存量的是名字,不换算就等于把用户的白名单静默清空。
+            self.allow_plugin = self._migrate_value(p)
         else:
             if p is not None:
                 print(f'{self.path} 里的 allow_plugin 不是数组,按默认值处理')
@@ -159,8 +251,7 @@ class Config:
 
         u = n.get('plugin_unsafe',None)
         if isinstance(u,list):
-            self.plugin_unsafe = list(dict.fromkeys(x for x in u
-                                                  if isinstance(x,str) and x))
+            self.plugin_unsafe = self._migrate_value(u)
         elif u is not None:
             print(f'{self.path} 里的 plugin_unsafe 不是数组,按默认值处理')
             self.plugin_unsafe = self._default('plugin_unsafe')
@@ -172,11 +263,13 @@ class Config:
         g = n.get('plugin_grants',None)
         if isinstance(g,dict):
             # 只收:插件名 -> {fs_read/fs_write: [路径], net/proc: true}
+            # 键按 identity 存(与 _plugin_persist 写盘时的口径一致)
             self.plugin_grants = {}
             for who,item in g.items():
                 if not isinstance(who,str) or not who or not isinstance(item,dict):
                     print(f'{self.path} 里的 plugin_grants {who!r} 无效,已忽略')
                     continue
+                who = self._migrate_who(who)
                 one = {}
                 for key in ('fs_read','fs_write'):
                     v = item.get(key,None)
@@ -225,6 +318,7 @@ class Config:
                 if not isinstance(who,str) or not who or not isinstance(item,dict):
                     print(f'{self.path} 里的 plugin_deny {who!r} 无效,已忽略')
                     continue
+                who = self._migrate_who(who)
                 one = {}
                 for key in ('fs_read','fs_write'):
                     v = item.get(key,None)
@@ -255,6 +349,7 @@ class Config:
                 if not isinstance(who,str) or not who or not isinstance(item,list):
                     print(f'{self.path} 里的 plugin_modules {who!r} 无效,已忽略')
                     continue
+                who = self._migrate_who(who)
                 names = list(dict.fromkeys(x for x in item
                                            if isinstance(x,str) and x.strip()))
                 if len(names) != len(item):
@@ -317,10 +412,8 @@ class Config:
                 return g
             # 沙盒的白名单是"目录级"的:这里归一成真正生效的目录,
             # 免得 config.json 里记着一个文件路径、实际放开的却是整个目录。
-            # 只有确定目标是已存在的文件时才收窄到父目录:目录原样保留,
-            # **不存在的路径也原样保留**。原来对任何非目录都取 dirname,等于
-            # "授权一个还不存在的文件"被静默放大成"授权它父目录",而弹窗上
-            # 展示的是原目标,用户看到的和实际授权的不是一回事。
+            # 与沙盒侧 _grant_root 同口径:已存在的文件取父目录,
+            # 不存在或本身是目录就原样(不上浮,免得把授权悄悄放大)。
             target = os.path.normcase(
                 os.path.realpath(os.path.normpath(os.path.abspath(target))))
             if os.path.isfile(target):
@@ -672,9 +765,20 @@ class Player:
         self.music_dict = d
         self.listb = l
         self.ml = ml
-        # 重扫之后已经不在列表里的曲目,没必要继续留在拉黑名单里
-        self._bad &= set(d.keys())
-        self._prompted &= set(d.keys())
+        # B8:_bad / _prompted 里存的是 _gate_key() 的结果 —— 曲目名缺失时它
+        # 会退化成路径,而 d.keys() 是曲目名。原来直接用 set(d.keys()) 取交集,
+        # 会把那些路径形态的键整批丢掉:重扫列表后,之前拉黑的坏文件重新回到
+        # 候选里,重新失败、重新弹窗。这里按 _gate_key 的真实口径转换。
+        keep = set()
+        for name in d:
+            if name:
+                keep.add(name)
+            else:
+                path = self._track_path(name)
+                if path and path != NO_FILE:
+                    keep.add(path)
+        self._bad &= keep
+        self._prompted &= keep
         if self._settled and self._settled not in d:
             self._settled = ''
         if not self._pumping:
@@ -847,7 +951,7 @@ class Player:
                 if key in self._bad:
                     
                     
-                    print(f'{name} 无法播放,单曲循环已停止,请换一首或检查文件')
+                    print(f'{label} 无法播放,单曲循环已停止,请换一首或检查文件')
                     self._set_status('播放失败:文件无法播放')
                     # M9:单曲循环遇到坏文件、决定放弃时,原来只推了 gen 却没摘
                     # 监听 —— 监听器会一直挂着,而 _listening 还停在 True
@@ -1188,8 +1292,18 @@ class Player:
             logging.exception('停止播放失败(忽略)')
         self._release_media()
         self.music_photo = None
-        self.music_player.release()
-        self.player.release()
+        # B7:同文件里其它收尾动作(stop / stop_poll / _release_media)都各自包了
+        # try/except,只有这两处 release 是裸的。而 cleanup_and_exit 的
+        # sys.exit(0) 在 finally **之后**:release 一抛异常,退出码那一句就被
+        # 跳过,窗口已销毁、托盘已停,进程却可能不走。
+        try:
+            self.music_player.release()
+        except Exception:
+            logging.exception('释放 MediaPlayer 失败(忽略)')
+        try:
+            self.player.release()
+        except Exception:
+            logging.exception('释放 vlc.Instance 失败(忽略)')
     def time_add_ten(self) -> None:
         if self.music_player.get_state() in (vlc.State.Playing,vlc.State.Paused):
             t = self.music_player.get_time()+10000
@@ -1270,6 +1384,11 @@ class SeekBar(ttkbootstrap.Frame):
 
     def _on_release(self, _event):
         self._dragging = False
+        # B13:与 _tick/_poll 同一道硬护栏 —— MediaPlayer/Instance 一旦 release,
+        # 再调 libvlc 就是进程级崩溃(不是能 catch 的 Python 异常)。关窗瞬间
+        # 松开进度条正好能踩到这个窗口。
+        if self._destroyed or getattr(self.media_player,'_released',False):
+            return
         if self._total > 0:
             ratio = self.scale.get() / self.SCALE_MAX
             self.media_player.set_time(int(self._total * ratio))
@@ -1537,10 +1656,25 @@ class Tkapp:
             self.style.theme_use(theme)
         else:
             print(f'没有可用的主题:{theme}')
-        self.raw_image_obj  = Image.open(os.path.join(BASE_DIR,'a.png'))
-        
-        self._tk_image_obj = ImageTk.PhotoImage(self.raw_image_obj.resize((16,16)))
-        self.app.iconphoto(True,self._tk_image_obj)
+        try:
+            self.raw_image_obj  = Image.open(os.path.join(BASE_DIR,'a.png'))
+            # B14:显式解码一次,别把坏图留到后面(托盘 run / 控件 PhotoImage)
+            self.raw_image_obj.load()
+            self._tk_image_obj = ImageTk.PhotoImage(self.raw_image_obj.resize((16,16)))
+            self.app.iconphoto(True,self._tk_image_obj)
+        except Exception:
+            # a.png 缺失/损坏不该让程序起不来:窗口图标换成 ttkbootstrap 自带
+            # 默认图标,托盘也走同一条(与 _default_photo 的容错口径一致)。
+            logging.exception('加载 a.png 失败,改用默认图标')
+            print(f'加载 {os.path.join(BASE_DIR,"a.png")} 失败,改用默认图标')
+            self.raw_image_obj = os.path.join(BASE_DIR,'a.png')
+            self._tk_image_obj = None
+            # 连默认图标也拿不到时直接不放,别为了一个图标把启动流程带挂
+            try:
+                self.app.iconphoto(True,ttkbootstrap.PhotoImage(
+                    name='default', file=ttkbootstrap.ICON, subsample=8))
+            except Exception:
+                logging.exception('设置默认窗口图标失败(忽略)')
 
         
         
@@ -1598,7 +1732,8 @@ class Tkapp:
         self.information_frame.rowconfigure([0,1],weight=1)
         self.information_frame.columnconfigure([0,1],weight=1)
 
-        ph = ImageTk.PhotoImage(Image.open(os.path.join(BASE_DIR,'a.png')).resize((int(600/4),int(600/4))))
+        ph = ImageTk.PhotoImage(_default_photo()
+                                .resize((int(600/4),int(600/4))))
         self.music_image = ttkbootstrap.Label(self.information_frame,image=ph)
         self.music_keep_not_clean = ph
         self.music_name = ttkbootstrap.Label(self.information_frame)
@@ -1681,10 +1816,18 @@ class Tkapp:
             if 'listbox' in n.exec_path:
                 self.run_listbox_list.append(_bind(n.run))
         def load_p(n:Plugin):
-            # 0) 身份登记失败(拿不到可信的代码来源)就不许跑,连沙盒都不给它建
+            # 0) 先建沙盒:身份登记是 create() 内部完成的,identity_ok 这个结论
+            #    得先在 _box 上存在,下面 _confirm_identity 才读得到。原来这两行
+            #    是反的 —— _confirm_identity 读 n._box.identity_ok 时 _box 还是
+            #    __init__ 里那个 None,于是每个走沙盒的插件都抛
+            #    AttributeError: 'NoneType' object has no attribute 'identity_ok'。
+            #    次序换了并不削弱 fail-closed:此刻插件代码一行都还没执行
+            #    (init/command 都要等 mainloop),身份登记读到的就是磁盘原样,
+            #    登记失败照样在下一行被挡下,连 init_i 都不会走到。
+            n.init_env()
+            # 0.5) 身份登记失败(拿不到可信的代码来源)就不许跑,后续一切都不做
             if not self._confirm_identity(n):
                 return
-            n.init_env()
             # 1) 把 config.json 里记住的授权喂回去(装载期、封存前)
             for cap,target in self.config.grants_for(n.identity):
                 try:

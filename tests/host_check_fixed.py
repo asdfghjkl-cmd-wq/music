@@ -74,8 +74,12 @@ def make_plugin_dir(declared, extra=None):
 def t_declared_name_cannot_hijack_unsafe():
     """H1 核心:自报 name 命中 plugin_unsafe 也没用,授权键是目录 realpath。"""
     cfg = b.Config()
-    # 真实 config.json 里就有 "debug"(而且没有同名目录 —— 正是原先可被劫持的空位)
-    assert 'debug' in cfg.plugin_unsafe, '前置条件变了:config 里应仍有旧值 "debug"'
+    # 装载期会把 config 里的历史插件名换算成 identity(见 Config._migrate_who),
+    # 所以现在存的是目录路径。"debug" 这个可被劫持的空位必须已经不再以名字形式存在。
+    assert 'debug' not in cfg.plugin_unsafe, \
+        '前置条件变了:config 里不该再有未迁移的名字 "debug"'
+    assert any(os.sep + 'plugin' + os.sep in v for v in cfg.plugin_unsafe), \
+        f'plugin_unsafe 应当已迁移成 identity:{cfg.plugin_unsafe!r}'
 
     d = make_plugin_dir('debug')
     n = b.Plugin(d, b.env_box(), set())
@@ -97,7 +101,8 @@ def t_declared_name_cannot_hijack_allowlist():
     cfg = b.Config()
     d = make_plugin_dir('sandbox_escape2')
     n = b.Plugin(d, b.env_box(), set())
-    assert 'sandbox_escape2' in cfg.allow_plugin, '前置条件变了:config 里应有旧值'
+    assert 'sandbox_escape2' not in cfg.allow_plugin, \
+        '前置条件变了:白名单里不该再有未迁移的名字(应已换算成 identity)'
     assert n.identity not in cfg.allow_plugin, \
         'H1 未修:自报 name 仍然白嫖了 allow_plugin 白名单'
 
@@ -169,16 +174,23 @@ def t_broken_config_backup_keeps_grants():
 
 @test
 def t_allow_plugin_deduped():
-    """L7:allow_plugin 也要去重(plugin_unsafe 早就去了)。"""
+    """L7:allow_plugin 也要去重(plugin_unsafe 早就去了)。
+
+    注意:名字必须挑**不与真实插件目录重名**的。迁移逻辑会拿"目录名"当候选旧名
+    (见 Config._plugin_candidates),所以像 "x" 这种恰好是 plugin/x 目录名的
+    字面量会被**有意**换算成 identity —— 那是迁移该有的行为,不是去重失败。
+    """
     d = os.path.join(TMP, 'dupcfg')
     os.makedirs(d, exist_ok=True)
     p = os.path.join(d, 'config.json')
     with io.open(p, 'w', encoding='utf-8') as fp:
-        json.dump({'allow_plugin': ['x', 'x', 'y', '', None, 'y']}, fp)
+        json.dump({'allow_plugin': ['namesake_a', 'namesake_a',
+                                    'namesake_b', '', None, 'namesake_b']}, fp)
     c = b.Config()
     c.path = p
     c.load()
-    assert c.allow_plugin == ['x', 'y'], f'去重结果不对:{c.allow_plugin!r}'
+    assert c.allow_plugin == ['namesake_a', 'namesake_b'], \
+        f'去重结果不对:{c.allow_plugin!r}'
 
 
 if __name__ == '__main__':

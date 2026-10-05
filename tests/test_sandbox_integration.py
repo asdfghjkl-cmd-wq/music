@@ -83,13 +83,19 @@ def t_wired():
     assert not hasattr(b, 'SandBox'), '不是重点,只是提醒'
     reg, host, plugins = load_all()
     names = sorted(p.name for p in plugins)
-    # 这份清单跟着 plugin/ 目录走:新增一个会被装载的插件,这里要一起加。
-    # (plugin/escape 是越权样本/PoC,can_exec:true 所以它也在这里;
-    #  plugin/escape2 是第三批"模块 globals"越权样本,同样 can_exec:true)
-    assert names == ['debug', 'exit_add', 'sandbox_escape', 'sandbox_escape2',
-                     'test', 'test_1', 'test_2'], names
+    # 这份清单跟着 plugin/ 目录走:plugin/ 里每个带 plugin.json 的目录都会装载。
+    # 当前是 9 个(escape=P1 越权样本、escape2=P3"模块 globals"样本、
+    # test-1 自报 sandbox_escape_2、x 自报 test、fs 自报 test_1、n 自报 debug)。
+    # 用集合比较而不是写死顺序,新增插件时只需改这一处数字。
+    assert len(names) == len(set(names)), f'插件显示名不该重名:{names}'
+    assert set(names) == {'debug', 'exit_add', 'sandbox_demo', 'sandbox_escape',
+                          'sandbox_escape2', 'sandbox_escape_2', 'test',
+                          'test_1', 'test_2'}, names
     assert reg.is_sealed(), '装载结束必须封存'
-    assert len(reg.boxes()) == 6, [x.env_id for x in reg.boxes()]     # test/test_1 共用 env 1
+    # env_id 现在由宿主按插件目录推导(不再采纳 plugin.json 自报的 env_id),
+    # 且跨目录共用同一个 env_id 会被 create() 拒绝 —— 所以是"每个插件一个沙盒"。
+    # 原来这里断言的是 6(旧语义下 test/test_1 共用一个)。
+    assert len(reg.boxes()) == len(plugins), [x.env_id for x in reg.boxes()]
 
 
 @test
@@ -102,9 +108,12 @@ def t_existing_plugins_still_work():
     assert 'debug' in labels and 'exit' in labels, labels
     debug_cmd = next(c['command'] for c in host.menu.commands if c['label'] == 'debug')
     assert callable(debug_cmd)
-    # 共用 env_id=1 的 test / test_1:一个写 a=64,另一个的命令 print(a) 看得到
-    assert by['test']._env_dict['a'] == 64
-    assert by['test']._box is by['test_1']._box, '共用 env_id 应当是同一个沙盒'
+    # H2 之后 x / fs 各自声明了 env_id=1,但来自不同目录 —— 第二个会被
+    # create() 拒绝并回退到自己的 identity 命名空间,而不是共用同一个沙盒。
+    # (旧语义是"共用 env_id 即共用命名空间",那正是跨插件互相覆盖变量的来源)
+    assert by['test']._box is not by['test_1']._box, \
+        '不同目录的插件不该共用一个沙盒'
+    assert by['test'].env_id != by['test_1'].env_id
     buf = io.StringIO()
     old = sys.stdout
     sys.stdout = buf
@@ -112,7 +121,8 @@ def t_existing_plugins_still_work():
         by['test_1'].run(host)                 # command: print(a),exec_path: play
     finally:
         sys.stdout = old
-    assert '64' in buf.getvalue(), buf.getvalue()
+    # a=64 仍由 x 的 init 写进它自己的命名空间;fs 跑的是另一个命名空间
+    assert by['test']._env_dict.get('a') == 64, by['test']._env_dict.get('a')
     # 点 debug 菜单项(用户的真实崩溃点就在这里):askstring 打桩,别真弹窗
     import tkinter.simpledialog as sd
     orig_ask = sd.askstring
@@ -183,8 +193,8 @@ def t_escape_fixture_blocked_through_loader():
         sys.stdout = old
     out = buf.getvalue()
     assert '被拦截' in out, out
-    assert reg.sandbox('2') is n._box
-    assert reg.a.get('2') is not None
+    assert reg.sandbox(n.env_id) is n._box
+    assert reg.a.get(n.env_id) is not None
 
     # 直接试"给自己授权",必须被宿主凭据挡住
     try:
@@ -216,8 +226,9 @@ def t_sealed_registry():
         pass
     else:
         raise AssertionError('未知 env_id 应当报错')
-    # 审计记录在案
-    box = reg.sandbox('2')
+    # 审计记录在案(env_id 现在等于插件目录 identity,不再是自报的 "2")
+    n = {p.name: p for p in plugins}.get('test_2') or list(plugins)[0]
+    box = reg.sandbox(n.env_id)
     assert box.events, '逃逸尝试应当留下审计记录'
 
 

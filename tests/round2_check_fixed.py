@@ -34,6 +34,10 @@ os.chdir(ROOT)
 
 import b as b
 
+# b_fixed.py 已改名为 b.py。这些用例是按"读源码文本"做断言的,所以从模块
+# 自身取路径,别再硬编码文件名 —— 否则一次改名就让它们集体 FileNotFoundError。
+B_SRC = os.path.abspath(getattr(b, '__file__', os.path.join(ROOT, 'b.py')))
+
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 except Exception:
@@ -437,7 +441,7 @@ def t_no_bare_gen_increment_outside_allowed_places():
       * `_stop` —— 注释里写明是有意补推,用于丢弃 _pending 里同一份坏媒体的旧事件
     其他任何地方出现,都意味着"只作废代次、没摘监听"的不一致状态又回来了。
     """
-    lines = io.open(os.path.join(ROOT, 'b_fixed.py'), encoding='utf-8').read().splitlines()
+    lines = io.open(B_SRC, encoding='utf-8').read().splitlines()
     cur = '?'
     found = {}
     for i, l in enumerate(lines, 1):
@@ -455,7 +459,7 @@ def t_no_bare_gen_increment_outside_allowed_places():
 @test
 def t_logging_installed_before_config_is_read():
     """L13:装日志必须排在读 config.json 之前,否则配置解析期的报错无处留痕。"""
-    src = io.open(os.path.join(ROOT, 'b_fixed.py'), encoding='utf-8').read()
+    src = io.open(B_SRC, encoding='utf-8').read()
     i_log = src.find('def _setup_logging()')
     i_main_guard = src.find("if __name__ == '__main__':")
     i_boot = src.find('_boot_config = Config()')
@@ -469,7 +473,7 @@ def t_logging_installed_before_config_is_read():
 @test
 def t_config_read_once_at_boot():
     """L12:启动路径上不应再出现两次独立的 Config() 构造。"""
-    src = io.open(os.path.join(ROOT, 'b_fixed.py'), encoding='utf-8').read()
+    src = io.open(B_SRC, encoding='utf-8').read()
     assert 'start_plugin = Config().start_plugin' not in src, \
         'L12 未修:仍然是独立 new 出来的第二个 Config 实例'
     assert 'start_plugin = _boot_config.start_plugin' in src, \
@@ -776,7 +780,7 @@ def t_deny_survives_garbage_config():
 @test
 def t_persist_deny_is_wired():
     """L14:宿主必须既接回调、又在装载时把记录喂回去。"""
-    src = io.open(os.path.join(ROOT, 'b_fixed.py'), encoding='utf-8').read()
+    src = io.open(B_SRC, encoding='utf-8').read()
     assert 'set_persist_deny(functools.partial(self._plugin_persist_deny,n))' in src, \
         'L14 未修:宿主没把 set_persist_deny 接上'
     assert 'self.config.denies_for(n.identity)' in src, \

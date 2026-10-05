@@ -80,7 +80,10 @@ def t_config_roundtrip():
 
     c2 = read_config()
     got = c2.grants_for('demo')
-    assert got.count(('fs:write', os.path.normpath(os.path.abspath(target)))) == 1, got
+    # Config.grant/load 用的是 abspath+normpath+normcase+realpath(与沙盒 _norm 对齐),
+    # 所以期望值也要按同一口径归一化,不能只用 normpath。
+    want = os.path.normcase(os.path.realpath(os.path.normpath(os.path.abspath(target))))
+    assert got.count(('fs:write', want)) == 1, got
     assert ('net', None) in got, got
     assert ('fs:read', None) not in got
     assert c2.plugin_unsafe == ['demo']
@@ -102,7 +105,12 @@ def t_config_invalid():
         'plugin_unsafe': ['a', '', 5, 'a', None],
     })
     c = read_config()
-    assert c.plugin_grants.get('ok') == {'fs_read': ['D:\\x'], 'fs_write': ['D:\\y'], 'net': True}, c.plugin_grants
+    # Config.load 用 realpath+normcase 归一化授权路径(和沙盒侧 _norm 对齐),
+    # Windows 下盘符/路径会折成小写,所以这里也要用 normcase 比。
+    want = {'fs_read': [os.path.normcase('D:\\x')],
+            'fs_write': [os.path.normcase('D:\\y')],
+            'net': True}
+    assert c.plugin_grants.get('ok') == want, c.plugin_grants
     assert 'bad' not in c.plugin_grants and 'nokey' not in c.plugin_grants
     assert c.plugin_unsafe == ['a'], c.plugin_unsafe
 
@@ -145,11 +153,17 @@ def t_persist():
     host = FakeHost(read_config())
     target = os.path.join(CFG_DIR, 'out')
     os.makedirs(target, exist_ok=True)
-    b.Tkapp._plugin_persist(host, 'demo', 'fs:write', target)
+    # _plugin_persist 按 n.identity 落盘、n.name 只用于打印,所以这里给个最小的假插件
+    class _Fake:
+        name = 'demo'
+        identity = 'demo-identity'
+    fake = _Fake()
+    b.Tkapp._plugin_persist(host, fake, fake.name, 'fs:write', target)
     c = read_config()
-    assert ('fs:write', os.path.normpath(os.path.abspath(target))) in c.grants_for('demo')
-    b.Tkapp._plugin_persist(host, 'demo', 'net', None)
-    assert ('net', None) in read_config().grants_for('demo')
+    want = os.path.normcase(os.path.realpath(os.path.normpath(os.path.abspath(target))))
+    assert ('fs:write', want) in c.grants_for(fake.identity)
+    b.Tkapp._plugin_persist(host, fake, fake.name, 'net', None)
+    assert ('net', None) in read_config().grants_for(fake.identity)
 
 
 @test
@@ -209,7 +223,8 @@ def t_unsafe_needs_user():
     finally:
         restore()
     assert n.sandbox_policy.unsafe is True
-    assert read_config().plugin_unsafe == ['debug'], read_config().plugin_unsafe
+    # H1 之后授权键是 identity(目录 realpath),不再是插件自报的 name("debug")
+    assert read_config().plugin_unsafe == [n.identity], read_config().plugin_unsafe
     try:
         n._box.can('net')
     except Exception:

@@ -293,8 +293,10 @@ def t_hook_install_once_and_wired():
 
 @test
 def t_docs_and_example_plugin():
-    assert os.path.isfile('SANDBOX.md'), '缺 SANDBOX.md'
-    doc = io.open('SANDBOX.md', encoding='utf-8').read()
+    _doc = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        'plugin_sandbox', 'SANDBOX.md')
+    assert os.path.isfile(_doc), f'缺 {_doc}'
+    doc = io.open(_doc, encoding='utf-8').read()
     for needle in ('不是安全边界', 'plugin_grants', 'plugin_unsafe', 'pro.menu',
                    'SandboxDenied', 'tests/run_all.py', 'Tcl'):
         assert needle in doc, f'SANDBOX.md 没提到 {needle}'
