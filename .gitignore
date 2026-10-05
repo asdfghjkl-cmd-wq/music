@@ -1,32 +1,62 @@
-__pycache__/
-__pycache__/bili_audio.cpython-313.pyc
-.vscode/settings.json
-music/a/info.json
-music/a/m.mp3
-music/as/a.mp4
-music/as/info.json
-music/n/a.mp3
-music/n/info.json
-music/n - 副本/a.mp3
-music/
-plugin/a.json
+# 修订版 .gitignore —— 修复 L15。
+#
+# 原版用 `plugin*` 一把抓,把沙盒源码和红队夹具一起忽略了,
+# 安全关键代码因此完全没有版本历史。
+#
+# 原版实测影响(git check-ignore -v 在本仓库跑出来的结果):
+#   .gitignore:32:plugin*  ->  plugin_sandbox/plugin_sandboxa.py          沙盒源码被忽略
+#   .gitignore:32:plugin*  ->  plugin/escape/a.py, plugin/escape2/a.py    红队夹具被忽略
+#   .gitignore:30:dsh*     ->  dsh/escape2_selftest_fixed.py              探针脚本被忽略
+#
+# 更正:早先版本的注释声称"b.py 被忽略",实测并不成立 ——
+# git check-ignore 对 b.py / b_fixed.py / tests/ 均无匹配。这里已改正。
+#
+# 用法:确认无误后用它替换 .gitignore。
 
-bili_audio.py
-a.py
-cookies.txt
-__pycache__/b.cpython-313.pyc
-_verify_fix3.py
-_verify_fix2.py
-_verify_fix.py
-b.py
-exit
-config.json
-plugin/
-tmp*
+# ---- Python 产物 ----
+__pycache__/
+*.pyc
+
+# ---- 编辑器/IDE ----
+.vscode/settings.json
 .idea
-j.py
-__pycache__/j.cpython-313.pyc
+
+# ---- 运行时数据(不跟踪) ----
+music/
+exit
+tmp*
 *.log
-dsh*
+
+# plugin/ 是插件数据目录;但 escape / escape2 是红队夹具(测试资产,要跟踪)。
+# 这里刻意只写 `plugin/*` —— 单个 `*` 不跨 `/`,所以 plugin/escape/ 下的文件
+# 不会被这条误伤;再用 !plugin/escape/ 把目录本身从忽略列表里摘出来。
+plugin/*
+!plugin/escape/
+!plugin/escape2/
+
+# ---- 本机状态 ----
+# config.json 含你的授权决策(allow_plugin / plugin_grants / plugin_unsafe / plugin_deny)。
+# 默认不跟踪;若希望多机同步授权,删掉下面这行。
+config.json
+
+# ---- 一次性脚本与临时产物 ----
+_verify_fix*.py
+bili_audio.py
+cookies.txt
+j.py
 _t*
-plugin*
+# dsh/ 里的探针脚本要跟踪,但它自己产生的临时结果不要
+dsh/_last_result.txt
+# 验证套件在仓库根建的临时目录(正常会自清理,这里兜底防误提交)
+_round2_*/
+_seccheck_*/
+_hostcheck_*/
+_esc2.log
+# 替换 .gitignore 时留下的备份:留在磁盘上可随时还原,但不进版本控制
+.gitignore.bak
+
+# ---- 注意:以下不再被忽略(原版误忽略) ----
+#   plugin_sandbox/    插件沙盒源码 + SANDBOX.md
+#   plugin/escape*/    红队越权样本
+#   dsh/               探针与自测脚本
+# b.py / b_fixed.py / tests/ 本来就没被忽略,无需处理。

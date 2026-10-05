@@ -20,10 +20,70 @@ except ModuleNotFoundError:
     logging.warning('mutagen不存在,无法加载音乐信息')
     start_music_message = False
 
+def _is_within(base,candidate):
+    """candidate 的 realpath 是否落在 base 的 realpath 之内(含 base 自身)。
+
+    用 os.path.commonpath 而不是字符串前缀:前缀比较会让 plugin/ab 匹配到
+    plugin/abc。commonpath 在不同盘符/不同 UNC 共享上会抛 ValueError,那种情况
+    一定不是"之内",连同路径为空一起按越界处理。大小写用 normcase 抹平
+    (Windows 不区分大小写),realpath 负责解开软链接/8.3 短名。
+    """
+    if not base or not candidate:
+        return False
+    try:
+        b = os.path.normcase(os.path.realpath(base))
+        c = os.path.normcase(os.path.realpath(candidate))
+        return os.path.commonpath([b,c]) == b
+    except (OSError,ValueError,TypeError) as e:
+        logging.debug(f'路径包含校验失败 {base!r} <- {candidate!r}:{e}')
+        return False
+
+def _close_quietly(obj,what):
+    """关掉 mutagen/PIL 对象(Windows 上不关会一直占着文件句柄)。
+
+    关闭失败只记 debug:收尾动作不能把播放流程带挂。
+    """
+    close = getattr(obj,'close',None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception as e:
+        logging.debug(f'关闭 {what} 失败(忽略):{e}')
+
+_DEFAULT_PHOTO = None
+_DEFAULT_PHOTO_TRIED = False
+
+def _default_photo():
+    """a.png 的模块级惰性单例:只 Image.open 一次,之后复用同一个对象。
+
+    返回 None 表示封面不可用(文件缺失/损坏)。这里绝不抛异常 —— 原来
+    load_message 里的裸调用一旦抛出去,set_media_path 就走不到 return True,
+    调用方以为失败,表现成"点了不播"。单例也顺手避免了每次切歌都新开一个
+    句柄又只关掉上一个的泄漏。
+    """
+    global _DEFAULT_PHOTO, _DEFAULT_PHOTO_TRIED
+    if _DEFAULT_PHOTO_TRIED:
+        return _DEFAULT_PHOTO
+    _DEFAULT_PHOTO_TRIED = True
+    try:
+        _DEFAULT_PHOTO = Image.open(os.path.join(BASE_DIR,'a.png'))
+    except Exception:
+        logging.exception('打开默认封面 a.png 失败,本次按无封面处理')
+        _DEFAULT_PHOTO = None
+    return _DEFAULT_PHOTO
+
 class Config:
 
+    # M11:start_sandbox 默认 True —— 插件默认在沙盒里跑。
+    # 设成 False 等于把插件代码直接 exec 在宿主环境上,不再有任何判权与询问,
+    # 是一次彻底的信任降级,必须由用户在设置里显式选择(且需重启才生效)。
     DEFAULT = {'theme': 'solarized-light', 'exit_way': 0,'allow_plugin':[],
-               'plugin_unsafe':[],'plugin_grants':{},'start_plugin':True,'start_sandbox':False}
+               'plugin_unsafe':[],'plugin_grants':{},'plugin_modules':{},
+               # L14:记住用户点过的"不再询问"(插件身份 -> 能力/目标)。
+               # 没有它,这个选择只在本次进程内有效,重启之后又问一遍。
+               'plugin_deny':{},
+               'start_plugin':True,'start_sandbox':True}
 
     @classmethod
     def _default(cls,key):
@@ -38,6 +98,8 @@ class Config:
         self.allow_plugin = self._default('allow_plugin')
         self.plugin_unsafe = self._default('plugin_unsafe')
         self.plugin_grants = self._default('plugin_grants')
+        self.plugin_modules = self._default('plugin_modules')
+        self.plugin_deny = self._default('plugin_deny')
         self.start_plugin = self._default('start_plugin')
         self.start_sandbox = self._default('start_sandbox')
         self.load()
@@ -50,6 +112,8 @@ class Config:
         self.allow_plugin = self._default('allow_plugin')
         self.plugin_unsafe = self._default('plugin_unsafe')
         self.plugin_grants = self._default('plugin_grants')
+        self.plugin_modules = self._default('plugin_modules')
+        self.plugin_deny = self._default('plugin_deny')
         self.start_plugin = self._default('start_plugin')
         self.start_sandbox = self._default('start_sandbox')
         try:
@@ -59,7 +123,9 @@ class Config:
             n = {}                      
         except (OSError,UnicodeDecodeError,json.JSONDecodeError) as e:
             logging.exception('读取配置文件失败,按默认配置处理')
-
+            # 坏配置留一份现场再按默认值走,不然下次保存会把它直接覆盖掉
+            # (FileNotFoundError 是 OSError 子类,上面已经先接住了,不会走到这里)
+            self._backup_broken_config()
             print(f'读取 {self.path} 失败,按默认配置处理:{e}')
             n = {}
         if not isinstance(n,dict):
@@ -84,7 +150,8 @@ class Config:
             if bad:
                 print(f'{self.path} 里的 allow_plugin 有 {len(bad)} 个无效项,已忽略:{bad!r}')
             # 空列表是合法值:表示不自动加载任何插件
-            self.allow_plugin = [x for x in p if isinstance(x,str) and x]
+            self.allow_plugin = list(dict.fromkeys(x for x in p
+                                                   if isinstance(x,str) and x))
         else:
             if p is not None:
                 print(f'{self.path} 里的 allow_plugin 不是数组,按默认值处理')
@@ -123,7 +190,11 @@ class Config:
                     paths = []
                     for p in v:
                         if isinstance(p,str) and p.strip():
-                            paths.append(os.path.normpath(p))
+                            # 和沙盒侧 _grant_root/_norm 对齐:abspath+normpath+
+                            # normcase+realpath。只做 normpath 的话相对路径会在
+                            # 沙盒的 cwd 下被重新解释,和用户当初授权的目录不是一回事。
+                            paths.append(os.path.normcase(
+                                os.path.realpath(os.path.normpath(os.path.abspath(p)))))
                         else:
                             print(f'{self.path} 里 {who} 的 {key} 有无效项 {p!r},已忽略')
                     if paths:
@@ -142,6 +213,57 @@ class Config:
         elif g is not None:
             print(f'{self.path} 里的 plugin_grants 不是对象,按默认值处理')
             self.plugin_grants = self._default('plugin_grants')
+
+        d = n.get('plugin_deny',None)
+        if isinstance(d,dict):
+            # 与 plugin_grants 同构:插件身份 -> {fs_read/fs_write: [目标], net/proc: true}。
+            # 注意:目标**原样收下、不做二次归一化** —— 沙盒存进来的是它自己用
+            # _grant_root() 算过的值,_ask_key 对"根"再算一次是幂等的,重新归一化
+            # 反而可能和沙盒的算法算歪,导致"不再询问"恢复不上。
+            self.plugin_deny = {}
+            for who,item in d.items():
+                if not isinstance(who,str) or not who or not isinstance(item,dict):
+                    print(f'{self.path} 里的 plugin_deny {who!r} 无效,已忽略')
+                    continue
+                one = {}
+                for key in ('fs_read','fs_write'):
+                    v = item.get(key,None)
+                    if v is None:
+                        continue
+                    if isinstance(v,str):
+                        v = [v]
+                    if not isinstance(v,list):
+                        print(f'{self.path} 里 {who} 的 {key} 不是数组,已忽略')
+                        continue
+                    targets = [p for p in v if isinstance(p,str) and p.strip()]
+                    if targets:
+                        one[key] = targets
+                for key in ('net','proc'):
+                    if item.get(key):
+                        one[key] = True
+                if one:
+                    self.plugin_deny[who] = one
+        elif d is not None:
+            print(f'{self.path} 里的 plugin_deny 不是对象,按默认值处理')
+            self.plugin_deny = self._default('plugin_deny')
+
+        m = n.get('plugin_modules',None)
+        if isinstance(m,dict):
+            # 只收:插件身份(目录 realpath) -> [确认放行的额外模块名]
+            self.plugin_modules = {}
+            for who,item in m.items():
+                if not isinstance(who,str) or not who or not isinstance(item,list):
+                    print(f'{self.path} 里的 plugin_modules {who!r} 无效,已忽略')
+                    continue
+                names = list(dict.fromkeys(x for x in item
+                                           if isinstance(x,str) and x.strip()))
+                if len(names) != len(item):
+                    print(f'{self.path} 里 {who} 的 plugin_modules 有无效项,已忽略')
+                if names:
+                    self.plugin_modules[who] = names
+        elif m is not None:
+            print(f'{self.path} 里的 plugin_modules 不是对象,按默认值处理')
+            self.plugin_modules = self._default('plugin_modules')
 
         try:
             self.exit_way = int(n.get('exit_way',self._default('exit_way')))
@@ -167,6 +289,25 @@ class Config:
             out.append(('proc',None))
         return out
 
+    def denies_for(self,name):
+        """把 config 里记住的"不再询问"摊平成 (能力,目标) 列表,装载时喂回沙盒。
+
+        L14:沙盒侧一直有 set_persist_deny / remember_denied 这一对入口,宿主却
+        从来没接 —— 于是"不再询问"只在本次进程内有效(靠进程里的 _never_ask),
+        重启之后同一个插件又会被完整地问一遍。
+        """
+        g = self.plugin_deny.get(name) or {}
+        out = []
+        for p in g.get('fs_read',()) or ():
+            out.append(('fs:read',p))
+        for p in g.get('fs_write',()) or ():
+            out.append(('fs:write',p))
+        if g.get('net'):
+            out.append(('net',None))
+        if g.get('proc'):
+            out.append(('proc',None))
+        return out
+
     def grant(self,name,cap,target=None):
         """记一条授权:插件运行期点"总是允许"时由播放器调用,随后由 save() 落盘。"""
         g = self.plugin_grants.setdefault(name,{})
@@ -175,9 +316,14 @@ class Config:
             if not target:
                 return g
             # 沙盒的白名单是"目录级"的:这里归一成真正生效的目录,
-            # 免得 config.json 里记着一个文件路径、实际放开的却是整个目录
-            target = os.path.normpath(os.path.abspath(target))
-            if not os.path.isdir(target):
+            # 免得 config.json 里记着一个文件路径、实际放开的却是整个目录。
+            # 只有确定目标是已存在的文件时才收窄到父目录:目录原样保留,
+            # **不存在的路径也原样保留**。原来对任何非目录都取 dirname,等于
+            # "授权一个还不存在的文件"被静默放大成"授权它父目录",而弹窗上
+            # 展示的是原目标,用户看到的和实际授权的不是一回事。
+            target = os.path.normcase(
+                os.path.realpath(os.path.normpath(os.path.abspath(target))))
+            if os.path.isfile(target):
                 target = os.path.dirname(target) or target
             g.setdefault(key,[])
             if target not in g[key]:
@@ -186,12 +332,31 @@ class Config:
             g[cap] = True
         return g
 
-    def _backup_broken_config(self):
-        """把无法解析的配置挪到带时间戳的 .bak,备份失败也不影响启动。
+    def deny(self,name,cap,target=None):
+        """记一条"不再询问":插件运行期点"不再询问"时由播放器调用,随后 save() 落盘。
 
-        原来这里直接 os.rename(path, path+".bak") 而且没有 try:
-        Windows 上 .bak 已存在会抛 FileExistsError,又没人接住,
-        结果是坏配置让程序启动即崩。os.replace 覆盖同名文件,不挑平台。
+        与 grant 的关键差别:这里**不做归一化**。沙盒传进来的 target 已经是它
+        自己用 _grant_root() 算好的值,原样存、原样喂回去,_ask_key 两侧的算法
+        才一致;再归一化一次就可能对不上,表现成"明明记了却还是弹窗"。
+        """
+        g = self.plugin_deny.setdefault(name,{})
+        if cap in ('fs:read','fs:write'):
+            key = 'fs_read' if cap == 'fs:read' else 'fs_write'
+            if not target:
+                return g
+            lst = g.setdefault(key,[])
+            if target not in lst:
+                lst.append(target)
+        elif cap in ('net','proc'):
+            g[cap] = True
+        return g
+
+    def _backup_broken_config(self):
+        """把读不出来的配置文件挪到带时间戳的 .bak,备份失败也不影响启动。
+
+        用 os.replace 而不是 os.rename:同名 .bak 已存在时也能覆盖,不挑平台。
+        整个动作包在 try 里 —— 备份失败只提示一句,不会让程序启动即崩。
+        注意调用方负责保证文件确实存在(FileNotFoundError 分支不该调这里)。
         """
         dst = f'{self.path}.{time.strftime("%Y%m%d-%H%M%S")}.bak'
         try:
@@ -209,6 +374,8 @@ class Config:
         self._dict['allow_plugin'] = self.allow_plugin
         self._dict['plugin_unsafe'] = self.plugin_unsafe
         self._dict['plugin_grants'] = self.plugin_grants
+        self._dict['plugin_modules'] = self.plugin_modules
+        self._dict['plugin_deny'] = self.plugin_deny
         self._dict['start_sandbox'] = self.start_sandbox
         self._dict['start_plugin'] = self.start_plugin
 
@@ -222,8 +389,27 @@ class Config:
             print(f'保存 {self.path} 失败:{e}')
 
 
-start_plugin = Config().start_plugin
-start_sandbox = Config().start_sandbox
+def _setup_logging():
+    """把日志写进 music.log。
+
+    只在作为主程序运行时调用 —— 本文件也会被插件 import,那时候不该去动调用方
+    的 logging 配置。L13:必须在读 config.json **之前**装好,否则"配置解析失败"
+    这类最需要留痕的报错会落在启动的空窗里,music.log 里什么都看不到。
+    """
+    logging.basicConfig(level=logging.DEBUG,
+                        filename=os.path.join(BASE_DIR,'music.log'),
+                        encoding='utf-8',
+                        format='%(asctime)s %(levelname)s [%(threadName)s] %(message)s')
+
+# L13:作为主程序启动时,先把日志装好,再去读配置
+if __name__ == '__main__':
+    _setup_logging()
+
+# L12:原来这里 new 了两次 Config() —— 两个实例各读一遍 config.json,
+# 既浪费也可能读到不一致的中间态。配置只有一份,读一次。
+_boot_config = Config()
+start_plugin = _boot_config.start_plugin
+start_sandbox = _boot_config.start_sandbox
 # 插件沙盒:能力模型、路径判定、封存与审计都在 plugin_sandbox.py 里。
 # env_box 由它提供,替代原先那个把 b.py 的 globals() 整个暴露给插件的实现。
 
@@ -239,6 +425,26 @@ if start_plugin and start_sandbox:
 
 
 NO_FILE = 'no<>found*.mp3*.mp4..'
+
+def _plugin_data_path(dir,rel,key):
+    """把 plugin.json 里的 init_file/command_file 解析成一个安全的绝对路径。
+
+    返回 None 表示拒绝读取(越界,或路径本身有问题)。插件可以用
+    '../..' / 绝对路径 / 软链接把自己的"代码文件"指到插件目录之外,
+    那等于绕过沙盒的来源判定去加载任意本地文件,所以越界一律不读,
+    只打印一条带越界路径和插件目录的警告。
+    """
+    try:
+        target = os.path.join(dir,rel)
+    except TypeError as e:
+        print(f'{key}={rel!r} 无法拼成路径,已忽略:{e}')
+        return None
+    if not _is_within(dir,target):
+        print(f'[沙盒] 警告:{key}={rel!r} 越出插件目录,已拒绝读取')
+        print(f'[沙盒]   插件目录:{os.path.realpath(dir)}')
+        print(f'[沙盒]   越界路径:{os.path.realpath(target)}')
+        return None
+    return target
 
 class Plugin_no_sandbox:
     def __init__(self,dir:str):
@@ -257,20 +463,24 @@ class Plugin_no_sandbox:
         self.init = n.get('init','').replace('from b import *','',1)
         init_file = n.get('init_file','')
         if init_file:
-            try:
-                with open(os.path.join(dir,init_file),'r',encoding="utf-8") as fp:
-                    self.init = fp.read().replace('from b import *','',1)
-            except Exception as e:
-                print(f'读取 {init_file} 失败,忽略:{e}')
+            p = _plugin_data_path(dir,init_file,'init_file')
+            if p is not None:
+                try:
+                    with open(p,'r',encoding="utf-8") as fp:
+                        self.init = fp.read().replace('from b import *','',1)
+                except Exception as e:
+                    print(f'读取 {init_file} 失败,忽略:{e}')
 
         self.command = n.get('command','')
         command_file = n.get('command_file','')
         if command_file:
-            try:
-                with open(os.path.join(dir,command_file),'r',encoding="utf-8") as fp:
-                    self.command = fp.read()
-            except Exception as e:
-                print(f'读取 {command_file} 失败,忽略:{e}')
+            p = _plugin_data_path(dir,command_file,'command_file')
+            if p is not None:
+                try:
+                    with open(p,'r',encoding="utf-8") as fp:
+                        self.command = fp.read()
+                except Exception as e:
+                    print(f'读取 {command_file} 失败,忽略:{e}')
 
         self.init_ok = False
         
@@ -279,10 +489,22 @@ class Plugin_no_sandbox:
         self.name = n.get('name','')
         self.can_exec = n.get('can_exec',False)
         self.exec_path = n.get('exec_path',[])
-        self.env_id = n.get('env_id','')
+        # M12:env_id 不能默认 ''。多个插件都用 '' 时 env_dict.get('') 会拿到
+        # **同一份**命名空间,插件之间互相覆盖变量。这里退回按插件目录 realpath
+        # 生成的唯一键,与沙盒那侧的 identity 口径一致。
+        self.env_id = str(n.get('env_id','') or os.path.normcase(os.path.realpath(dir)))
         
     def init_env(self,env_dict:dict):
-        self.env_dict = env_dict.get(self.env_id,dict(globals()))
+        box = env_dict.get(self.env_id,None)
+        if box is None:
+            # 无沙盒模式下插件本来就要能拿到宿主环境(这是该模式的既定语义,
+            # 删掉会废掉所有老插件),但至少给每个插件各自一份,不与他人共用。
+            box = dict(globals())
+            msg = (f'插件 {self.name} 以【无沙盒】模式运行,'
+                   f'可直接访问宿主环境,不受任何权限限制')
+            logging.warning(msg)
+            print('[警告] ' + msg)
+        self.env_dict = box
         self.env_dict['__env_id__']  = self.env_id
         self.env_dict['__start_sandbox__'] = start_sandbox
         env_dict[self.env_id] =self.env_dict
@@ -294,13 +516,16 @@ class Plugin_no_sandbox:
         
         if not self.can_exec or self.init_ok:
             return
-        self.init_ok = True
         try:
             # 先编译:语法错误在这里就能拿到,不用等回调里再炸
             code = compile(self.init,f'<plugin {self.name} init>','exec')
         except Exception as e:
             print(f'插件 {self.name} 的 init 代码无法编译,已跳过:{e}')
             return
+        # L8:init_ok 只能在编译成功之后置位。原来放在 compile 之前,编译一失败
+        # 它已经是 True —— run() 于是照样去执行 command 代码,在一个连 init 都
+        # 没跑起来的环境里运行插件逻辑。
+        self.init_ok = True
         def _run_init():
             # 插件代码出问题只应该影响它自己,不能把整个播放器带崩
             try:
@@ -332,6 +557,11 @@ class Plugin_no_sandbox:
                 traceback.print_exc()
         tkaapp.app.after(0,_run_command)
 
+# M14:状态文字走队列用的哨兵。Player._pending 里正常压的是
+# (path,end_action,gen,failed) 四元组;这里用模块级对象占第一位,
+# 不会与任何真实路径相等,也不受"代"(gen)作废的影响。
+_STATUS = object()
+
 class Player:
     def __init__(self,d:dict): 
         params = [
@@ -343,6 +573,16 @@ class Player:
         self.player= vlc.Instance(" ".join(params))
 
         self.music_photo = None
+        # 当前 set_mrl 得到的 Media 对象。libvlc 的 set_mrl 每次都会新建一个,
+        # 拿不住引用就没法释放(不释放会一直占着文件句柄/解码资源),
+        # 所以这里必须自己记着,换曲和退出时显式 release。
+        self._media = None
+        # cleanup() 是否已经跑过。release() 之后再碰 music_player 会调用到已经
+        # 析构的 libvlc 对象 —— 那是进程级崩溃,不是能 catch 的 Python 异常,
+        # 所以 SeekBar 的轮询也用这个标志当硬护栏。
+        self._released = False
+        # 供 cleanup() 显式停掉进度条轮询(Tkapp 建好 SeekBar 后回填)。
+        self.seekbar = None
 
         self.play_tt = 0
 
@@ -439,7 +679,16 @@ class Player:
             self._settled = ''
         if not self._pumping:
             self._pumping = True
-            self._pump()
+            # M8:不要在这里**同步**跑 _pump。set_dict_and_tk_obj 是在 flush_music
+            # 重建列表**之前**被调用的,同步处理队列里压着的切歌事件会读到旧列表。
+            # 投到事件循环的下一拍,等列表重建完再处理。
+            lb = self.listb
+            if lb is not None:
+                try:
+                    lb.after(0,self._pump)
+                except tkinter.TclError:
+                    logging.exception('启动播放事件轮询失败')
+                    self._pumping = False
     def set_play_way(self,aint):
         
         if 0<=aint<=2:self.play_tt = aint
@@ -462,14 +711,21 @@ class Player:
         try:
             while True:
                 path,end_action,gen,failed = self._pending.get_nowait()
+                if path is _STATUS:
+                    # 状态文字只是给用户看的提示,不受"代"作废影响
+                    self._apply_status(end_action)
+                    continue
                 if gen != self._gen:
                     
                     
                     continue
                 try:
                     self._advance(path,end_action,failed)
-                except Exception :
+                except Exception:
+                    # L5:静默吞掉会让"下一首永远不来"变成无迹可寻的故障。
+                    # 至少让用户看见,并把现场留在日志里。
                     logging.exception('处理播放结束事件失败')
+                    self._apply_status('播放流程出错,详见日志')
                     
         except queue.Empty:
             pass
@@ -502,6 +758,28 @@ class Player:
             return False
         return ans == '是'
 
+    def _track_path(self,name):
+        """取某首曲目在当前媒体类型(音频/视频)下的路径,可能为空。"""
+        try:
+            return self.music_dict.get(name,{}).get(self.media_key,'') or ''
+        except Exception:
+            logging.exception('取曲目路径失败')
+            return ''
+
+    def _gate_key(self,name,path=None):
+        """L10/L11:`_bad` / `_prompted` 这两个拦截闸门用的键。
+
+        它们原来直接拿曲目名当键。曲目名**可能为空**(标签缺失、只按路径列出来的
+        情形),空串会让所有无名曲目共用一个键:只要其中一首被拉黑,
+        `_playable` 就会对后面每一首都返回 '',单曲循环也会被误停。
+        名字缺失时退回用路径 —— 路径对一首曲目是唯一的。
+
+        名字非空时返回值与原来**完全一致**,所以具备名字的曲目行为不变。
+        """
+        if path is None:
+            path = self._track_path(name)
+        return name or path
+
     def _stop(self):
         # stop() 摘监听时会 _gen += 1,但 _pending 里可能还压着同一份坏媒体的
         # EncounteredError 事件。这里再推一次 _gen,让队列里的旧事件在 _pump
@@ -511,20 +789,24 @@ class Player:
 
     def _advance(self,path,end_action,failed=False):
         name = self.music_message.get('name') or ''
+        # L10/L11:闸门键与展示名分开。名字缺失时 key 会退回路径,
+        # 避免所有无名曲目共用 '' 而互相污染拉黑/弹窗记忆。
+        key = self._gate_key(name,path)
+        label = name or path
         # 已经在本次播放里问过并处理过这一首了:
         # VLC 对一个坏文件会连着抛好几个 EncounteredError,而且"回答否→重放"
         # 本身就会再造一个新事件。没有这个闸门,事件会一轮轮喂回来,
         # 弹窗/重放就停不下来 —— 这就是按"否"后无限循环的根。
         # 只有用户手动重新起播(start_current)才会解锁,到时可以再问。
-        if name and name == self._settled:
+        if key and key == self._settled:
             return
         # 下面收集"这一轮要不要弹窗、弹什么",弹窗只做一次。
         # 按"否"= 允许播放(不拉黑),但事件链必须在这里断掉,不再重放。
         ask = None
         if failed:
             # 打开/解码失败是确定性证据,不用等短播计数攒够三次,直接拉黑
-            if name and name not in self._prompted:
-                self._prompted.add(name)
+            if key and key not in self._prompted:
+                self._prompted.add(key)
                 ask = '无法打开音频,可能出现了问题,是否不允许播放'
             self._short_plays = 0
         elif time.monotonic() - self._play_started < 0.5:
@@ -533,18 +815,18 @@ class Player:
                 # 数够了就清零:不管回答是"是"还是"否",都不能带着 3 这个计数
                 # 往下走,否则下一次事件又会立刻满足 >=3 再弹一次。
                 self._short_plays = 0
-                if name and name not in self._prompted:
-                    self._prompted.add(name)
+                if key and key not in self._prompted:
+                    self._prompted.add(key)
                     ask = '音频可能出现问题,是否不允许播放'
         else:
             self._short_plays = 0
 
         if ask is not None:
-            if self._ask_keep(name,ask):
-                self._bad.add(name)
-                print(f'{name} 无法正常播放,自动切歌不再选它')
+            if self._ask_keep(label,ask):
+                self._bad.add(key)
+                print(f'{label} 无法正常播放,自动切歌不再选它')
                 self._set_status('播放失败:文件无法播放')
-                self._settled = name
+                self._settled = key
                 self._stop()
                 if self.play_tt in (1,2):
                     # 拉黑之后没必要再重放这一首:顺序/随机模式直接切下一首。
@@ -553,21 +835,24 @@ class Player:
             # 回答"否":用户认定文件没问题,允许播放 —— 不拉黑,但这一轮的
             # 事件链到此为止(重放同一个坏文件只会立刻再失败一次,再弹一次框)。
             # 也把弹窗记忆去掉,用户手动重播时可以重新问,不会被静默拉黑。
-            self._settled = name
-            self._prompted.discard(name)
-            print(f'{name} 播放异常,已按用户选择保留,停止自动重放,可手动重试或换一首')
+            self._settled = key
+            self._prompted.discard(key)
+            print(f'{label} 播放异常,已按用户选择保留,停止自动重放,可手动重试或换一首')
             self._set_status('播放异常:已停止自动重放')
             self._stop()
             return
 
         match self.play_tt:
             case 0:       
-                if name in self._bad:
+                if key in self._bad:
                     
                     
                     print(f'{name} 无法播放,单曲循环已停止,请换一首或检查文件')
                     self._set_status('播放失败:文件无法播放')
-                    self._gen += 1          
+                    # M9:单曲循环遇到坏文件、决定放弃时,原来只推了 gen 却没摘
+                    # 监听 —— 监听器会一直挂着,而 _listening 还停在 True
+                    # (状态不一致,后续 _listen 的判断会跟着错)。走 _stop_listen。
+                    self._stop_listen()          
                     return
                 ok = self._replay(name,path,end_action)
                 self._after_switch(ok,path,end_action)
@@ -594,7 +879,8 @@ class Player:
 
     def _playable(self,name):
         
-        if name in self._bad:
+        # L10/L11:闸门键统一走 _gate_key,免得无名曲目在这里被误判成"已拉黑"
+        if self._gate_key(name) in self._bad:
             return ''
         p = self.music_dict.get(name,{}).get(self.media_key,'')
         return p if p and p != NO_FILE else ''
@@ -631,47 +917,79 @@ class Player:
         
         # _next_seq/_next_random 已经过滤过拉黑名单,这里再兜一次底:
         # 任何情况下都不自动切到已知放不出来的曲目,否则会来回空转。
-        if name in self._bad:
+        _key = self._gate_key(name) if name is not None else ''
+        if _key and _key in self._bad:
             print(f'{name} 已被标记为无法播放,忽略这次自动切歌')
             name = None
         if name is None:
             print('没有可播放的下一首,自动切歌停止')
             self._set_status('无可播放的下一首')
-            self._gen += 1
+            # M9:这里原本是裸的 _gen += 1 —— 只作废了事件代次,却没摘掉 VLC 的
+            # 事件监听,监听器会一直挂着而 _listening 还停在 True(状态不一致,
+            # 后续 _listen 也会因为 _listening 判断而漏挂/错挂)。走 _stop_listen。
+            self._stop_listen()
             return
         path = self._playable(name)
         ok = self._replay(name,path,end_action)
-        if ok:
-            keys = list(self.music_dict.keys())
-            if name in keys:
-                self._select_index(keys.index(name))
+        # M8:先真正开始播放,再做界面选中。
+        # 原来 _select_index 在前且毫无保护:它一旦抛异常(TclError 等),后面的
+        # _after_switch 就永远不执行 —— 用户看到的表现就是"点了却不播"。
+        # 界面选中只是锦上添花,绝不能挡住播放这条主路径。
         self._after_switch(ok,path,end_action)
+        if ok:
+            try:
+                keys = list(self.music_dict.keys())
+                if name in keys:
+                    self._select_index(keys.index(name))
+            except Exception:
+                logging.exception('切歌后同步选中项失败(忽略)')
     def set_volume(self,volume):
         self.music_player.audio_set_volume(volume)
-    def _set_status(self,text):
-        # 状态文字只有 Tk 线程能碰,保留 after(0) 是为了万一有插件从别的线程调用
-        w = self.listb if self.listb is not None else self.ml
-        if w is None:
+    def _warn_no_file_soon(self):
+        """L6:延迟弹出"未指定文件"提示。
+
+        原来直接写 `self.listb.after(50, lambda: ... parent=self.listb.master)`:
+        既没有判空(self.listb 在控件就绪前是 None),lambda 又是 50ms 后才求值的,
+        那时 self.listb 可能已经变成 None —— 一个提示弹窗反而把播放流程打断。
+        这里先把控件抓在手里并判空。
+        """
+        lb = self.listb
+        if lb is None:
+            logging.warning('未指定文件,但列表控件尚未就绪,跳过提示')
             return
-        def _apply():
-            ml = self.ml
-            if ml is None:
-                return
-            try:
-                ml.config(text=text)
-            except tkinter.TclError:
-                logging.exception('更新状态文字失败')
-                pass
         try:
-            w.after(0,_apply)
+            lb.after(50,lambda: ttkbootstrap.Messagebox.show_warning('未指定文件',parent=lb.master))
         except tkinter.TclError:
-            logging.exception('投递状态文字更新失败')
-            pass
+            logging.exception('投递"未指定文件"提示失败')
+
+    def _set_status(self,text):
+        # M14:`after(0)` 不是线程安全边界 —— 从非 Tk 线程调 widget.after() 本身
+        # 就是未定义行为(Tk 不是线程安全的),拿它当"切回主线程"的手段是错的。
+        # 改成投进 _pending,由 Tk 线程上的 _pump 统一消费并写控件
+        # (与托盘命令走 _ui_queue 是同一个模式)。控件还没就绪也没关系,
+        # 事件先排队,等 _pump 起来再逐条落到控件上。
+        self._pending.put((_STATUS,text,self._gen,False))
+
+    def _apply_status(self,text):
+        # 只在 Tk 线程上被 _pump 调用
+        ml = self.ml
+        if ml is None:
+            return
+        try:
+            ml.config(text=text)
+        except tkinter.TclError:
+            logging.exception('更新状态文字失败')
 
     def start_current(self):
         # 播放已经 set_mrl 好的媒体,并把短播计时的起点重置到此刻。
         # 给 _after_switch 和 Tkapp 用,外部就不必再去改 _play_started 了。
-        self.play()
+        # L9:libvlc 起不来时 play() 是**返回 -1**,不是抛异常。原来直接把返回值
+        # 丢掉,用户看到的就是"点了没反应、也没有任何提示"。这里接住并如实告知。
+        if self.play() == -1:
+            logging.warning('libvlc 拒绝开始播放(play() 返回 -1):%r',
+                            self.music_message.get('name'))
+            self._set_status('播放失败:播放器无法启动')
+            return False
         self._play_started = time.monotonic()
         # 这里是"用户/流程明确要开播当前这一首"的唯一入口(选曲、切模式、
         # 自动切歌成功都会走到),所以在这里清掉弹窗记忆与"已处理"闸门:
@@ -679,6 +997,7 @@ class Player:
         #   - 自动切歌进了新的一首,那一首的弹窗记忆也不需要留着。
         self._prompted.clear()
         self._settled = ''
+        return True
 
     def _after_switch(self,ok,path,end_action):
         if not ok:
@@ -692,13 +1011,58 @@ class Player:
         if end_action is not None:
             end_action()
 
+    def _set_media(self,path):
+        """set_mrl 并接住返回的 Media,释放上一次的。
+
+        原来丢掉了 set_mrl 的返回值,libvlc 每次新建的 Media 就再没人释放,
+        换曲越多占得越多。释放旧对象放在赋新值之前,失败只记日志 ——
+        释放失败不该让这次切歌失败。
+        """
+        old = self._media
+        self._media = self.music_player.set_mrl(path)
+        if old is not None:
+            try:
+                old.release()
+            except Exception:
+                logging.exception('释放上一个 Media 失败(忽略)')
+        return self._media
+
+    def _release_media(self):
+        media = self._media
+        self._media = None
+        if media is not None:
+            try:
+                media.release()
+            except Exception:
+                logging.exception('释放 Media 失败(忽略)')
+
+    def _set_cover(self,pic_data=None):
+        """统一设置封面:pic_data 为 None 时回到 a.png 的惰性单例。
+
+        这里绝不抛异常:封面拿不到最多是没图,不能连带把"点了不播"带出来。
+        注意不再 close 上一张封面:原来在 load_message 里无条件
+        `self.music_photo.close()`,而切换失败时 self.music_photo 又会被赋成
+        默认封面单例,下一次就把它关掉了 —— 关掉的是一个全局缓存对象,
+        之后再没人能重建它(PIL 的 close 不会抛,所以失败是静默的)。
+        旧封面交给 GC 回收即可,显示用的 PhotoImage 由 Tkapp 自己持有。
+        """
+        if pic_data is None:
+            self.music_photo = _default_photo()
+            return
+        try:
+            self.music_photo = Image.open(io.BytesIO(pic_data))
+        except Exception:
+            logging.exception('解码内嵌封面失败,回退到默认封面')
+            self.music_photo = _default_photo()
+
     def set_media_path_mv(self,name,path,end_action=None):
         if not path or path == NO_FILE:
-            self.listb.after(50,lambda:(ttkbootstrap.Messagebox.show_warning('未指定文件',parent=self.listb.master)))
+            self._warn_no_file_soon()
             return False
         self._stop_listen()            
-        self._gen += 1
-        self.music_player.set_mrl(path)
+        # M9:_stop_listen() 内部已经无条件地 _gen += 1(在 _listening 判断之前),
+        # 这里原来又推了一次 —— 重复自增,纯冗余。
+        self._set_media(path)
         # 标签/封面的来源显式给出:优先用同名音乐文件的标签;
         # 没有可用的音乐文件时传 None(而不是把 NO_FILE 哨兵当路径去读标签),
         # 由 load_message 统一负责重置信息与封面。
@@ -709,58 +1073,85 @@ class Player:
         self.load_message(name,tag_path)
         if end_action is not None:
             self._listen(path,end_action)
+        # load_message 保证不抛:封面失败也必须按"切歌成功"返回,
+        # 否则调用方不播,表现成"点了不播"。
         return True
 
 
     def set_media_path(self,name:str,path:str,end_action=None):
         
         if not path or path == NO_FILE:
-            self.listb.after(50,lambda:ttkbootstrap.Messagebox.show_warning('未指定文件',parent=self.listb.master))
+            self._warn_no_file_soon()
             return False
         self._stop_listen()            
-        self._gen += 1
-        self.music_player.set_mrl(path)
+        # M9:_stop_listen() 内部已经无条件地 _gen += 1(在 _listening 判断之前),
+        # 这里原来又推了一次 —— 重复自增,纯冗余。
+        self._set_media(path)
         self.media_key = 'music'
+        self.load_message(name,path)
         if end_action is not None:
             self._listen(path,end_action)
-        self.load_message(name,path)
+        # 同上:封面失败不影响返回值,load_message 已经把异常吃掉。
         return True
 
 
     def load_message(self,name:str,path:"str | None"):
-        
-        
-        
-        
+        """读标签/封面。**本方法保证不抛**:任何失败都退化成"没有信息+默认封面"。
+
+        约束来自调用方:set_media_path 走完这里才会 return True,一旦这里抛出去,
+        调用方就以为切歌失败而不播放,用户看到的就是"点了却不播"。
+        """
         self.music_message = {'name': name}
-        if self.music_photo:
-            self.music_photo.close()
-        self.music_photo = Image.open(os.path.join(BASE_DIR,'a.png'))
-        if not path or path == NO_FILE:
-            # 没有标签来源:只保留默认封面与空信息,不做无意义的标签读取
-            return
-        if not start_music_message:
-            return
+        self._set_cover(None)
         try:
-            a = mutagen.File(path,easy=True)
-            if a is not None:                  
-                for aa,b in a.items():
-                    self.music_message[aa] = b
-            _,b = os.path.splitext(path)
-            b:str
-            if b.lower() == '.flac':
-                audio = mutagen.flac.FLAC(path)
-                for pic in audio.pictures:
-                    self.music_message['pic_mine'] = pic.mime
-                    self.music_photo = Image.open(io.BytesIO(pic.data))
-            elif b.lower() == '.mp3':
-                tags = mutagen.id3.ID3(path)
-                for pic in tags.getall("APIC"):
-                    self.music_message['pic_mine'] = pic.mime
-                    self.music_photo = Image.open(io.BytesIO(pic.data))
+            if not path or path == NO_FILE:
+                # 没有标签来源:只保留默认封面与空信息,不做无意义的标签读取
+                return
+            if not start_music_message:
+                return
+            self._read_tags(path)
         except Exception:
             logging.exception('读取标签或封面失败')
             traceback.print_exc()
+            try:
+                self.music_message = {'name': name}
+                self._set_cover(None)
+            except Exception:
+                logging.exception('重置音乐信息失败(忽略)')
+
+    def _read_tags(self,path):
+        """真正的标签读取。mutagen 的对象一律 try/finally 显式关闭:
+        Windows 上不关就锁着文件,重命名/删除都会失败。
+        """
+        a = None
+        try:
+            a = mutagen.File(path,easy=True)
+            if a is not None:
+                for aa,b in a.items():
+                    self.music_message[aa] = b
+        finally:
+            # mutagen.File 返回的对象也可能持有文件句柄,别赌它有 __del__ 会关
+            _close_quietly(a,'mutagen.File')
+        _,b = os.path.splitext(path)
+        b:str
+        if b.lower() == '.flac':
+            audio = None
+            try:
+                audio = mutagen.flac.FLAC(path)
+                for pic in audio.pictures:
+                    self.music_message['pic_mine'] = pic.mime
+                    self._set_cover(pic.data)
+            finally:
+                _close_quietly(audio,'mutagen.flac.FLAC')
+        elif b.lower() == '.mp3':
+            tags = None
+            try:
+                tags = mutagen.id3.ID3(path)
+                for pic in tags.getall("APIC"):
+                    self.music_message['pic_mine'] = pic.mime
+                    self._set_cover(pic.data)
+            finally:
+                _close_quietly(tags,'mutagen.id3.ID3')
     def play(self) -> int:
         self._set_status('播放')
         return self.music_player.play()
@@ -772,8 +1163,31 @@ class Player:
         self._stop_listen()
         self.music_player.stop()
     def cleanup(self):
+        # 先把 _released 置位再动 release():SeekBar 的轮询护栏靠它判断
+        # "MediaPlayer 已经不能碰了"。顺序反过来的话,release() 和护栏之间
+        # 就有一个窗口期,那时 _tick 仍然会去调 libvlc —— 进程级崩溃。
+        # 两个对象上都要置:SeekBar 拿到的是 Tkapp 传进去的 music_player
+        # (vlc.MediaPlayer),不是这里的 Player 包装对象。
+        self._released = True
+        try:
+            self.music_player._released = True
+        except Exception:
+            logging.exception('在 MediaPlayer 上标记已释放失败(忽略)')
+        sb = self.seekbar
+        if sb is not None:
+            # 显式停掉进度条轮询,不再等 <Destroy> 事件(那时 Tk 树可能已经散了)
+            try:
+                sb.stop_poll()
+            except Exception:
+                logging.exception('停止进度条轮询失败(忽略)')
+            self.seekbar = None
         self._stop_listen()
-        self.music_player.stop()
+        try:
+            self.music_player.stop()
+        except Exception:
+            logging.exception('停止播放失败(忽略)')
+        self._release_media()
+        self.music_photo = None
         self.music_player.release()
         self.player.release()
     def time_add_ten(self) -> None:
@@ -834,11 +1248,21 @@ class SeekBar(ttkbootstrap.Frame):
     def _on_destroy(self,event):
         if event.widget is not self:
             return
+        self.stop_poll()
+
+    def stop_poll(self):
+        """停掉轮询。幂等,可重复调用。
+
+        置 _destroyed 之后 _tick/_poll 都不再排期;after_cancel 失败(控件已散、
+        解释器在收尾)只记日志,不能把调用方带挂 —— 退出流程里这是收尾动作。
+        """
         self._destroyed = True
-        if self._after_id is not None:
-            try:self.after_cancel(self._after_id)
-            except Exception:pass
-            self._after_id = None
+        aid,self._after_id = self._after_id,None
+        if aid is not None:
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                logging.exception('取消进度条轮询失败(忽略)')
 
     
     def _on_press(self, _event):
@@ -866,7 +1290,7 @@ class SeekBar(ttkbootstrap.Frame):
         self._poll()
 
     def _poll(self):
-        if self._destroyed:
+        if self._destroyed or getattr(self.media_player,'_released',False):
             return
         try:
             self._tick()
@@ -883,6 +1307,11 @@ class SeekBar(ttkbootstrap.Frame):
             self._after_id = None
 
     def _tick(self):
+        # 硬护栏:MediaPlayer/Instance 一旦 release,再调 libvlc 就是进程级崩溃
+        # (不是能 catch 的 Python 异常)。这里直接 return 且**不重新排期** ——
+        # 排期会把已经死掉的 player 一直问下去。
+        if self._destroyed or getattr(self.media_player,'_released',False):
+            return
         mp = self.media_player
         if self._dragging:
             return
@@ -915,22 +1344,26 @@ class Plugin:
         self.init = n.get('init','').replace('from b import *','',1)
         init_file = n.get('init_file','')
         if init_file:
-            try:
-                with open(os.path.join(dir,init_file),'r',encoding="utf-8") as fp:
-                    self.init = fp.read().replace('from b import *','',1)
-            except Exception as e:
-                logging.exception('读取插件 init 文件失败')
-                print(f'读取 {init_file} 失败,忽略:{e}')
+            p = _plugin_data_path(dir,init_file,'init_file')
+            if p is not None:
+                try:
+                    with open(p,'r',encoding="utf-8") as fp:
+                        self.init = fp.read().replace('from b import *','',1)
+                except Exception as e:
+                    logging.exception('读取插件 init 文件失败')
+                    print(f'读取 {init_file} 失败,忽略:{e}')
 
         self.command = n.get('command','').replace('from b import *','',1)
         command_file = n.get('command_file','')
         if command_file:
-            try:
-                with open(os.path.join(dir,command_file),'r',encoding="utf-8") as fp:
-                    self.command = fp.read().replace('from b import *','',1)
-            except Exception as e:
-                logging.exception('读取插件 command 文件失败')
-                print(f'读取 {command_file} 失败,忽略:{e}')
+            p = _plugin_data_path(dir,command_file,'command_file')
+            if p is not None:
+                try:
+                    with open(p,'r',encoding="utf-8") as fp:
+                        self.command = fp.read().replace('from b import *','',1)
+                except Exception as e:
+                    logging.exception('读取插件 command 文件失败')
+                    print(f'读取 {command_file} 失败,忽略:{e}')
 
         self.init_ok = False
         
@@ -975,6 +1408,10 @@ class Plugin:
             self.privilege = []
         
         self.dir = dir
+        # 插件身份 = 插件目录的规范化 realpath(Windows 下 normcase 折成小写)。
+        # 授权/白名单一律用 identity 当键:name 是插件在 plugin.json 里自报的,
+        # 改个名字就能冒领别人的授权,也能靠重名撞上别人的白名单。
+        self.identity = os.path.normcase(os.path.realpath(dir))
         # 沙盒策略:plugin.json 的 sandbox 段 + 历史 privilege。
         # 解析只做校验:字段写错只会更严,不会变成"不受限制"。
         self.sandbox_policy = parse_policy(n.get('sandbox',None),self.privilege,dir)
@@ -984,12 +1421,14 @@ class Plugin:
 
         self.n = n
 
-        self.env_id = str(self.n.get('env_id',self.name))
+        # env_id 用插件身份,不再听插件自报的 env_id:否则两个目录不同的插件
+        # 只要自报同一个 env_id 就能共用一个沙盒命名空间(H2)
+        self.env_id = self.identity
     def init_env(self):
 
         # 命名空间由沙盒提供:默认只给"读插件自己的目录",写/网络/进程都要授权。
         # 建沙盒要带宿主凭据:插件自己调 create 是改不动策略的
-        self._box = self.env_dict.create(self.env_id,self.name,self.dir,
+        self._box = self.env_dict.create(self.identity,self.name,self.dir,
                                          self.sandbox_policy,
                                          _host_token=_HOST_TOKEN)
         self._env_dict = self._box.namespace
@@ -1003,7 +1442,6 @@ class Plugin:
             return
         
             
-        self.init_ok = True
         try:
             
             # 先编译:语法错误在这里就能拿到,不用等回调里再炸
@@ -1012,6 +1450,9 @@ class Plugin:
             logging.exception('编译插件 init 代码失败')
             print(f'插件 {self.name} 的 init 代码无法编译,已跳过:{e}')
             return
+        # L8:同 Plugin_no_sandbox —— init_ok 必须在编译成功之后才置位,
+        # 否则编译失败的插件照样会去执行 command 代码。
+        self.init_ok = True
         def _run_init():
             # 插件代码出问题只应该影响它自己,不能把整个播放器带崩
             try:
@@ -1146,6 +1587,9 @@ class Tkapp:
 
         self.seek = SeekBar(self.Progress_bar,self.player.music_player,owner=self.player)
         self.seek.grid(row=0,column=1,sticky='ew')
+        # 回填给 Player:cleanup() 没有别的途径拿到这个进度条,而它必须在
+        # release() 之前把 500ms 的轮询停掉(见 Player.cleanup / SeekBar._tick)。
+        self.player.seekbar = self.seek
         self.music_minus_ten_button = ttkbootstrap.Button(self.Progress_bar,text='⏪',command=self.player.time_minus_ten)
         self.music_minus_ten_button.grid(row=0,column=0)
         self.music_add_ten_button = ttkbootstrap.Button(self.Progress_bar,text='⏩️',command=self.player.time_add_ten)
@@ -1237,18 +1681,34 @@ class Tkapp:
             if 'listbox' in n.exec_path:
                 self.run_listbox_list.append(_bind(n.run))
         def load_p(n:Plugin):
+            # 0) 身份登记失败(拿不到可信的代码来源)就不许跑,连沙盒都不给它建
+            if not self._confirm_identity(n):
+                return
             n.init_env()
             # 1) 把 config.json 里记住的授权喂回去(装载期、封存前)
-            for cap,target in self.config.grants_for(n.name):
+            for cap,target in self.config.grants_for(n.identity):
                 try:
                     n._box.grant(cap,target,_host_token=_HOST_TOKEN)
                 except SandboxDenied as e:
                     print(f'[沙盒] 恢复 {n.name} 的授权失败,已忽略:{e}')
+            # 1.5) 同样把"不再询问"恢复回去。缺了这一步,用户上次点过的
+            # "不再询问"重启后全部失效,同一个插件又被完整问一遍(L14)。
+            for cap,target in self.config.denies_for(n.identity):
+                try:
+                    n._box.remember_denied(cap,target,_host_token=_HOST_TOKEN)
+                except SandboxDenied as e:
+                    print(f'[沙盒] 恢复 {n.name} 的"不再询问"失败,已忽略:{e}')
             # 2) unsafe 申请要用户确认过才真的放开
             self._confirm_unsafe(n)
+            # 2.5) 额外模块同样要用户确认,且不受沙盒代理
+            self._confirm_modules(n)
             # 3) 运行期要权限时问用户,并把"总是允许"写进 config.json
             n._box.set_ask(self._plugin_ask)
-            n._box.set_persist(self._plugin_persist)
+            # 持久化回调带上插件对象:沙盒侧只知道显示名,写配置要按 identity
+            n._box.set_persist(functools.partial(self._plugin_persist,n))
+            # L14:沙盒侧一直有 set_persist_deny 入口,宿主却没接 —— 用户点
+            # "不再询问"只在本次进程内有效,重启之后又问一遍。
+            n._box.set_persist_deny(functools.partial(self._plugin_persist_deny,n))
             n.init_i(self)
             self.plugin_list.append(n)
             
@@ -1266,6 +1726,17 @@ class Tkapp:
         self.scrollbar.grid(row=0,column=1,sticky='n')
         self.down_frame_listbox.bind('<<ListboxSelect>>', self.change_music)
         if os.path.isdir(plugin_dir) and start_plugin:
+            if not start_sandbox:
+                # M11:无沙盒是彻底的信任降级。原先改这个开关既不提示、也不要求
+                # 重启,插件还能自己调 pro.config.save() 把降级固化下来。现在每次
+                # 以无沙盒模式启动都显著告知一次。
+                msg = ('沙盒已关闭:插件代码将直接运行在宿主环境中,'
+                       '不会被判权,也不会再有任何权限询问。')
+                logging.warning(msg)
+                print('[警告] ' + msg)
+                ttkbootstrap.Messagebox.show_warning(
+                    msg + '\n\n如需恢复保护,请在插件设置里重新勾选"启用沙盒"并重启程序。',
+                    parent=self.app)
             for asa in sorted(os.listdir(plugin_dir)):
                 mn = os.path.join(plugin_dir,asa)
                 if not os.path.isdir(mn):continue
@@ -1277,7 +1748,7 @@ class Tkapp:
                     else: n=Plugin_no_sandbox(mn)
                     
                     assigned_names.add(n.name)
-                    if n.name in self.config.allow_plugin:
+                    if n.identity in self.config.allow_plugin:
                         # 沙盒策略在装载期一次定好(见 plugin_sandbox),插件自己改不了
                         if start_sandbox:
                             load_p(n)
@@ -1292,7 +1763,7 @@ class Tkapp:
                                                          parent=self.app,buttons=['是','否']) == '是':
                             if ttkbootstrap.Messagebox.yesno('是否默认加载',title='插件',
                                                              parent=self.app,buttons=['是','否']) == '是':
-                                self.config.allow_plugin.append(n.name)
+                                self.config.allow_plugin.append(n.identity)
                             if start_sandbox:load_p(n)
                             else:load_q(n)
                 except Exception as e:
@@ -1346,9 +1817,28 @@ class Tkapp:
         self.down_frame_listbox.selection_set(self.index)
         self.down_frame_listbox.see(self.index)
     def cleanup_and_exit(self):
-        self.app.destroy()
-        self.backround_icon.stop()
-        self.player.cleanup()
+        # M13:幂等 —— 托盘退出和 WM_DELETE_WINDOW 两条路都会走到这里。
+        # 没有这道闸,重复进入会把 destroy()/release() 跑第二遍,而对着已经释放的
+        # MediaPlayer 再动手是进程级崩溃(不是可捕获的 Python 异常)。
+        if getattr(self,'_cleaned',False):
+            return
+        self._cleaned = True
+        # 顺序很重要:先 cleanup 再 destroy。
+        # 原来是 destroy 在前 —— destroy 会拆掉 Tk 树、触发 SeekBar 的 <Destroy>,
+        # 但在那之后到 player.cleanup() 真正 release() 之间,500ms 的轮询仍可能
+        # 被事件循环再跑一次,那时去碰 MediaPlayer 就是进程级崩溃。
+        # 反过来先 cleanup:它自己会置 _released 并显式 stop_poll(),窗口期消失。
+        try:
+            self.player.cleanup()
+        finally:
+            # M13:收尾动作彼此独立,一个失败不能拖住另一个,否则窗口关不掉、
+            # 托盘图标残留、进程退不干净。
+            for what,fn in (('销毁主窗口',self.app.destroy),
+                            ('停止托盘图标',self.backround_icon.stop)):
+                try:
+                    fn()
+                except Exception:
+                    logging.exception(f'{what}失败(忽略)')
         sys.exit(0)
 
     def play_stop(self,e):
@@ -1384,9 +1874,19 @@ class Tkapp:
         a.pack()
         p.pack()
         def save():
+            was = self.config.start_sandbox
             self.config.start_plugin = n.get()
             self.config.start_sandbox = f.get() 
             self.config.save()
+            if bool(was) != bool(self.config.start_sandbox):
+                # M11:这个开关只在启动时读一次,改了必须重启;关掉沙盒是重大降级,
+                # 不能只写进配置就完事,得当面告知用户。
+                if self.config.start_sandbox:
+                    msg = '沙盒已开启,需要重启程序才生效。'
+                else:
+                    msg = ('沙盒已关闭,需要重启程序才生效。\n'
+                           '关闭后插件代码将直接运行在宿主环境中,不再有任何权限限制。')
+                ttkbootstrap.Messagebox.show_warning(msg,parent=ui)
             ui.destroy()
         ttkbootstrap.Button(ui,text="保存",command=save).pack()
     def _pump_ui(self):
@@ -1406,11 +1906,14 @@ class Tkapp:
         except queue.Empty:
             pass
         except tkinter.TclError:
-            return                      
+            # M10:原来这里是 `return` —— 一次 TclError 就把轮询永久停掉,
+            # 托盘菜单从此静默失效(不报错、不响应)。改成记日志后照常重新排期,
+            # 让下一次心跳还有机会恢复。
+            logging.exception('处理托盘命令时出错(已忽略,轮询继续)')
         try:
             self.app.after(100,self._pump_ui)
         except tkinter.TclError:
-            pass
+            logging.exception('重新排期托盘轮询失败')
     _EXIT_DIRECT = 0
     _EXIT_TRAY = 1
     _EXIT_ASK = 2
@@ -1475,7 +1978,9 @@ class Tkapp:
     def play(self):
         for xnn in self.run_play_list:xnn()
         
-        self.player.play()
+        # L9:同样是接住返回值 —— play() 起不来时返回 -1,原来完全静默。
+        if self.player.play() == -1:
+            ttkbootstrap.Messagebox.show_warning('播放失败:播放器无法启动',parent=self.app)
     def pause(self):
         for xnn in self.run_pause_list:xnn()
         self.player.pause()
@@ -1641,17 +2146,71 @@ class Tkapp:
         return {'允许本次':ASK_YES,'本次运行都允许':ASK_SESSION,
                 '总是允许':ASK_ALWAYS,'不再询问':ASK_NEVER}.get(r,'no')
 
-    def _plugin_persist(self,name,cap,target):
-        """用户点了"总是允许":记进 config.json,以后装载自动生效。"""
-        self.config.grant(name,cap,target)
+    def _plugin_persist(self,n,name,cap,target):
+        """用户点了"总是允许":按插件身份记进 config.json,以后装载自动生效。
+
+        注册时用 functools.partial 绑定了插件对象,沙盒仍按老约定传显示名,
+        所以这里收下 name 只为兼容调用约定(写配置一律用 n.identity)。
+        """
+        self.config.grant(n.identity,cap,target)
         self.config.save()
-        print(f'[沙盒] 已记住:{name} 可以使用 {cap} {target or ""}')
+        print(f'[沙盒] 已记住:{n.name} 可以使用 {cap} {target or ""}')
+
+    def _plugin_persist_deny(self,n,name,cap,target):
+        """用户点了"不再询问":按插件身份记进 config.json,以后这一类直接拒绝、不再弹窗。
+
+        与 _plugin_persist 对称:沙盒只传显示名,写配置一律用 n.identity。
+        target 是沙盒用 _grant_root() 算好后传来的,这里原样落盘(见 Config.deny)。
+        """
+        try:
+            self.config.deny(n.identity,cap,target)
+            self.config.save()
+        except Exception:
+            logging.exception('保存"不再询问"失败')
+            return
+        print(f'[沙盒] 已记住:{n.name} 以后不再询问 {cap} {target or ""}')
+
+    def _confirm_identity(self,n):
+        """插件代码身份登记失败时不可运行:身份都定不下来,授权记给谁都不对。"""
+        if not n._box.identity_ok:
+            print(f'[沙盒] {n.name} 的插件代码身份登记失败'
+                  f'(目录 {n.dir} 无法确认为可信来源),已拒绝加载')
+            return False
+        return True
+
+    def _confirm_modules(self,n):
+        """插件申请额外模块:模块不受沙盒代理,只有你确认过(记在 config)才放行。"""
+        if not n.sandbox_policy.modules_requested:
+            return False
+        if n.identity in self.config.plugin_modules:
+            names = list(self.config.plugin_modules[n.identity])
+            n._box.approve_modules(names,_host_token=_HOST_TOKEN)
+            print(f'[沙盒] {n.name} 按你之前的确认,放行额外模块:{"、".join(names)}')
+            return True
+        try:
+            ans = ttkbootstrap.Messagebox.yesno(
+                f'插件「{n.name}」申请额外模块:{"、".join(n.sandbox_policy.modules_requested)}\n\n'
+                '这些模块不受沙盒代理:插件一旦拿到它们,等于拥有完全权限,\n'
+                '可以绕开沙盒读写任意文件、联网、启动进程。\n\n'
+                '是否允许?(允许后会记在 config.json 的 plugin_modules 里)',
+                '插件申请额外模块',parent=self.app,buttons=['是','否']) == '是'
+        except Exception:
+            logging.exception('插件额外模块的询问失败,按拒绝处理')
+            ans = False
+        if not ans:
+            print(f'[沙盒] {n.name} 申请额外模块但你未同意,按拒绝处理')
+            return False
+        self.config.plugin_modules[n.identity] = list(n.sandbox_policy.modules_requested)
+        self.config.save()
+        n._box.approve_modules(self.config.plugin_modules[n.identity],
+                               _host_token=_HOST_TOKEN)
+        return True
 
     def _confirm_unsafe(self,n):
         """插件声明"不受沙盒限制":只有你确认过(记在 config)才真的放开。"""
         if not n.sandbox_policy.unsafe_requested:
             return False
-        if n.name in self.config.plugin_unsafe:
+        if n.identity in self.config.plugin_unsafe:
             n._box.set_unsafe(True,_host_token=_HOST_TOKEN)
             print(f'[沙盒] {n.name} 按你之前的确认,完全不受沙盒限制')
             return True
@@ -1667,7 +2226,7 @@ class Tkapp:
         if not ans:
             print(f'[沙盒] {n.name} 要求不受限制但你未同意,按受限处理')
             return False
-        self.config.plugin_unsafe.append(n.name)
+        self.config.plugin_unsafe.append(n.identity)
         self.config.save()
         n._box.set_unsafe(True,_host_token=_HOST_TOKEN)
         return True
@@ -1732,12 +2291,9 @@ class Tkapp:
 
 
 def main():
-    # 只在真正启动播放器时配置日志:本文件也会被插件 import,
-    # 那时候不该去动调用方的 logging 配置。
-    logging.basicConfig(level=logging.DEBUG,
-                        filename=os.path.join(BASE_DIR,'music.log'),
-                        encoding='utf-8',
-                        format='%(asctime)s %(levelname)s [%(threadName)s] %(message)s')
+    # 日志已在模块级按 __main__ 条件装好(见 _setup_logging),这里只兜一次底:
+    # 万一是被别的方式拉起来的,也要保证日志落到 music.log。
+    _setup_logging()
 
     # 审计钩子:插件绕开沙盒门面(内省拿到真 os/socket)时的第二道闸
     if start_plugin and start_sandbox:

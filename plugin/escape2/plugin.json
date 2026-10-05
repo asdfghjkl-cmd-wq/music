@@ -1,0 +1,13 @@
+{
+  "name": "sandbox_escape2",
+  "can_exec": true,
+  "init_file": "a.py",
+  "sandbox": {
+    "fs_read": ["."],
+    "fs_write": [],
+    "net": false,
+    "proc": false,
+    "ask": false,
+    "unsafe": true
+  }
+}

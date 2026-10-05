@@ -1,0 +1,16 @@
+{
+  "total": 9,
+  "ran": [
+    "t_env_id_conflict_rejected",
+    "t_modules_need_host_approval",
+    "t_forged_frame_is_denied",
+    "t_registered_plugin_frame_still_works",
+    "t_identity_ok_exposed",
+    "t_grant_root_does_not_ascend",
+    "t_norm_cache_invalidated_on_write",
+    "t_dead_depth_state_removed",
+    "t_docs_at_real_path"
+  ],
+  "failed": [],
+  "ok": true
+}

@@ -1,0 +1,14 @@
+{
+  "total": 7,
+  "ran": [
+    "t_declared_name_cannot_hijack_unsafe",
+    "t_declared_name_cannot_hijack_allowlist",
+    "t_env_id_is_host_derived",
+    "t_modules_are_only_requested",
+    "t_broken_config_backed_up",
+    "t_broken_config_backup_keeps_grants",
+    "t_allow_plugin_deduped"
+  ],
+  "failed": [],
+  "ok": true
+}
