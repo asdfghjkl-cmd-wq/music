@@ -2199,8 +2199,8 @@ class Tkapp:
         self._bind_plugin_exec(n)
         return True
 
-    def _load_sandboxed(self,n):
-        """沙盒装载(原 __init__ 里的 load_p);运行期加载也走这一条。
+    def _load_sandboxed(self,n,seal=False):
+        """沙盒装载(原 __init__ 里的 load_p);装载期和运行期加载都走这一条。
 
         0) 先建沙盒:身份登记是 create() 内部完成的,identity_ok 这个结论得先在
            _box 上存在,下面 _confirm_identity 才读得到。原来这两行是反的 ——
@@ -2208,11 +2208,20 @@ class Tkapp:
            None,于是每个走沙盒的插件都抛 AttributeError。次序换了并不削弱
            fail-closed:此刻插件代码一行都还没执行,登记失败照样在下一行被挡下。
 
-        末尾比装载期多一步 seal:装载结束时宿主会 env_dict.seal() 把策略全部
-        冻住,而运行期新建的沙盒不在那一次遍历里 —— 不在这里补一刀,后加载的
-        这个插件就成了全场唯一策略还能改的沙盒。
+        seal 只该由**运行期加载**传 True。装载期一律 False —— 那时候宿主会在
+        所有插件装完之后统一 env_dict.seal(),而声明了 share_env 的插件是**共用**
+        同一个沙盒的:在这里提前封存,同 env_id 的后来者一进门就撞上"已封存,
+        不能再改 _ask"(plugin/fs 和 plugin/x 都是 env_id=1,正好踩着这条)。
         """
         n.init_env()
+        # share_env 的插件复用别人建好的沙盒。装载期它一定还没封存(封存是全部
+        # 装完才统一做的);运行期再加载时那个沙盒早被封上了,这里不可能再往它
+        # 上面挂回调。这不是越权,只是运行期装不进来 —— 给一句能看懂的话,
+        # 不要把 SandboxDenied 原样抛到用户脸上。
+        if n._box.is_sealed():
+            print(f'[沙盒] {n.name} 要用的沙盒(env_id={n.env_id!r})已经封存,'
+                  f'运行期加载不进来;重启后会随装载一起生效')
+            return False
         if not self._confirm_identity(n):
             return False
         for cap,target in self.config.grants_for(n.identity):
@@ -2231,10 +2240,11 @@ class Tkapp:
         n._box.set_persist(functools.partial(self._plugin_persist,n))
         n._box.set_persist_deny(functools.partial(self._plugin_persist_deny,n))
         n.init_i(self)
-        try:
-            n._box.seal()
-        except Exception:
-            logging.exception('运行期加载后封存沙盒失败')
+        if seal:
+            try:
+                n._box.seal()
+            except Exception:
+                logging.exception('运行期加载后封存沙盒失败')
         self.plugin_list.append(n)
         self._bind_plugin_exec(n)
         return True
@@ -2254,8 +2264,8 @@ class Tkapp:
             if sandboxed:
                 n = Plugin(p['dir'],self.env_dict,
                            {q.name for q in self.plugin_list})
-                if not self._load_sandboxed(n):
-                    return False,'身份登记没通过,已拒绝加载'
+                if not self._load_sandboxed(n,seal=True):
+                    return False,'装载流程拒绝了它(原因见控制台/日志里的 [沙盒] 那一行)'
             else:
                 n = Plugin_no_sandbox(p['dir'])
                 self._load_no_sandbox(n)

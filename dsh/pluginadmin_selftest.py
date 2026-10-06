@@ -481,6 +481,83 @@ def test_zip_end_to_end(tmpdir):
     check(not os.path.exists(target), '测试收尾把装进去的插件删干净了')
 
 
+# ---------------------------------------------------------------- G
+
+def test_shared_env(tmpdir):
+    """回归:share_env 的几个插件共用沙盒,先装的不能把它提前封死。
+
+    plugin/fs(name=test_1,env_id=1)和 plugin/x(name=test,env_id=1)就是这个形状。
+    曾经 _load_sandboxed 无条件在末尾 seal,于是 fs 一装完就把共享沙盒封上,
+    轮到 x 时 set_ask 抛 "沙盒已封存,不能再改 _ask",整个插件被跳过。
+    """
+    print('--- G. 共用沙盒的插件(回归:提前 seal 会误伤后来者) ---')
+    import ttkbootstrap
+    from plugin_sandbox.plugin_sandboxa import env_box
+
+    root = ttkbootstrap.Window(themename='solarized-light')
+    root.withdraw()
+    cfg = fresh_config(os.path.join(tmpdir, 'config5.json'))
+
+    class FakeApp(m.Tkapp):
+        def __init__(self, root, cfg, registry):
+            self.config = cfg
+            self.app = root
+            self.plugin_list = []
+            self.env_dict = registry
+            self.run_play_list = []
+            self.run_pause_list = []
+            self.run_listbox_list = []
+
+    app = FakeApp(root, cfg, env_box())
+    loaded = []
+    for folder in ('share_a', 'share_b'):
+        full = os.path.join(tmpdir, folder)
+        os.makedirs(full, exist_ok=True)
+        write_text(os.path.join(full, 'plugin.json'),
+                   json.dumps({'name': folder, 'can_exec': True,
+                               'env_id': 1, 'share_env': True,
+                               'init': "MARK = '%s'" % folder}))
+        plugin = m.Plugin(full, app.env_dict,
+                          {q.name for q in app.plugin_list})
+        ok = app._load_sandboxed(plugin)
+        loaded.append(plugin)
+        check(ok, f'{folder} 装载成功(没被前一个插件提前封死)')
+
+    if len(loaded) == 2 and all(p._box is not None for p in loaded):
+        check(loaded[0]._box is loaded[1]._box,
+              '两个 share_env 插件确实共用同一个沙盒对象')
+        check(loaded[0].env_id == loaded[1].env_id == 'shared',
+              "env_id 是 'shared'(自报的 1 是数字,按 _shared_env_key 的规则回退),"
+              '所以这两个插件才会共用一个沙盒', str(loaded[0].env_id))
+        box = loaded[0]._box
+        check(not box.is_sealed(), '装载期全程不封存(封存由 env_dict.seal() 统一做)')
+
+        app.env_dict.seal()
+        check(box.is_sealed(), 'env_dict.seal() 之后它才被封存')
+
+        late = os.path.join(tmpdir, 'share_c')
+        os.makedirs(late, exist_ok=True)
+        write_text(os.path.join(late, 'plugin.json'),
+                   json.dumps({'name': 'share_c', 'can_exec': True,
+                               'env_id': 1, 'share_env': True}))
+        extra = m.Plugin(late, app.env_dict, {q.name for q in app.plugin_list})
+        try:
+            ok = app._load_sandboxed(extra, seal=True)
+            raised = None
+        except Exception as e:
+            ok, raised = None, e
+        check(raised is None,
+              '沙盒封存后运行期加载共享插件被干净拒绝,而不是抛异常', repr(raised))
+        check(ok is False, '返回 False(没装进来)')
+        check(all(p is not extra for p in app.plugin_list),
+              '被拒的插件没有混进 plugin_list')
+
+    # 让排期好的 init 回调先跑完,免得 destroy 之后 Tk 报 invalid command name
+    root.update()
+    root.update()
+    root.destroy()
+
+
 # ---------------------------------------------------------------- B
 
 def test_scan():
@@ -720,6 +797,7 @@ def main():
         test_load_now(tmpdir)
         test_zip(tmpdir)
         test_zip_end_to_end(tmpdir)
+        test_shared_env(tmpdir)
         test_scan()
         cfg2 = fresh_config(os.path.join(tmpdir, 'config2.json'))
         test_window(cfg2, tmpdir)
