@@ -88,7 +88,7 @@ class Config:
                # L14:记住用户点过的"不再询问"(插件身份 -> 能力/目标)。
                # 没有它,这个选择只在本次进程内有效,重启之后又问一遍。
                'plugin_deny':{},
-               'start_plugin':True,'start_sandbox':True}
+               'start_plugin':True,'start_sandbox':True,'close_safe_really_plugin':[]}
 
     @classmethod
     def _default(cls,key):
@@ -110,6 +110,7 @@ class Config:
         self.plugin_deny = self._default('plugin_deny')
         self.start_plugin = self._default('start_plugin')
         self.start_sandbox = self._default('start_sandbox')
+        self.close_safe_really_plugin =  self._default('close_safe_really_plugin')
         self.load()
     
     @staticmethod
@@ -135,6 +136,12 @@ class Config:
         for entry in names:
             full = os.path.join(plugin_dir, entry)
             if not os.path.isdir(full):
+                continue
+            if not os.path.isfile(os.path.join(full, 'plugin.json')):
+                # 必须与装载循环同口径(load_music 里"没有 plugin.json 就 continue")。
+                # 否则一个没有 plugin.json 的目录会白占一个候选名、还会把 taken
+                # 推高一格,于是后面真正的插件算出的 final 与 Plugin 的消歧结果
+                # 错位,历史配置里的插件名就换算不到正确的 identity。
                 continue
             declared = ''
             try:
@@ -206,8 +213,9 @@ class Config:
         self.plugin_deny = self._default('plugin_deny')
         self.start_plugin = self._default('start_plugin')
         self.start_sandbox = self._default('start_sandbox')
+        self.close_safe_really_plugin = self._default('close_safe_really_plugin')
         try:
-            with open(self.path,'r',encoding='utf-8') as fp:
+            with open(self.path,'r',encoding='utf-8-sig') as fp:
                 n = json.load(fp)
         except FileNotFoundError:
             n = {}                      
@@ -249,6 +257,22 @@ class Config:
                 print(f'{self.path} 里的 allow_plugin 不是数组,按默认值处理')
             self.allow_plugin = self._default('allow_plugin')
 
+        c = n.get('close_safe_really_plugin')
+        if isinstance(c,list):
+            bad = [x for x in c if not (isinstance(x,str) and x)]
+            if bad:
+                print(f'{self.path} 里的 close_safe_really_plugin 有 {len(bad)} 个无效项,已忽略:{bad!r}')
+            # 空列表是合法值:表示不自动加载任何插件。
+            # L16:逐项把历史配置里的「插件名」换算成 identity —— 授权键早已
+            # 改成目录 realpath(H1:自报 name 不能再决定授权归属),但 config 里
+            # 存量的是名字,不换算就等于把用户的白名单静默清空。
+            self.close_safe_really_plugin = self._migrate_value(c)
+        else:
+            if c is not None:
+                print(f'{self.path} 里的 close_safe_really_plugin 不是数组,按默认值处理')
+            self.close_safe_really_plugin = self._default('close_safe_really_plugin')
+
+            
         u = n.get('plugin_unsafe',None)
         if isinstance(u,list):
             self.plugin_unsafe = self._migrate_value(u)
@@ -471,11 +495,17 @@ class Config:
         self._dict['plugin_deny'] = self.plugin_deny
         self._dict['start_sandbox'] = self.start_sandbox
         self._dict['start_plugin'] = self.start_plugin
+        self._dict['close_safe_really_plugin'] = self.close_safe_really_plugin
 
         tmp = self.path + '.tmp'
         try:
             with open(tmp,'w',encoding='utf-8') as fp:
                 json.dump(self._dict,fp,ensure_ascii=False)
+                # 原子替换只保证"读者要么看到旧文件要么看到新文件",不保证内容
+                # 已经落盘:掉电/崩溃后可能留下一个被截断的 config.json,下次
+                # 启动就被判成"损坏",白名单与授权被整体重置。替换前先刷盘。
+                fp.flush()
+                os.fsync(fp.fileno())
             os.replace(tmp,self.path)
         except OSError as e:
             logging.exception('保存配置文件失败')
@@ -534,10 +564,42 @@ def _plugin_data_path(dir,rel,key):
         return None
     if not _is_within(dir,target):
         print(f'[沙盒] 警告:{key}={rel!r} 越出插件目录,已拒绝读取')
-        print(f'[沙盒]   插件目录:{os.path.realpath(dir)}')
-        print(f'[沙盒]   越界路径:{os.path.realpath(target)}')
+        # 诊断打印本身也不能抛:realpath 在 Windows 上遇到超长/非法路径会抛
+        # OSError,那样"拒绝读取"的路径反而变成一次未捕获异常。
+        for _label,_value in (('插件目录',dir),('越界路径',target)):
+            try:
+                _shown = os.path.realpath(_value)
+            except Exception:
+                _shown = _value
+            print(f'[沙盒]   {_label}:{_shown}')
         return None
     return target
+
+
+def _plugin_share_env(manifest,name):
+    """读 plugin.json 的 share_env:只有显式 true 才算声明,其余一律按"不共享"。
+
+    它决定这个插件能不能用自报的 env_id 去和别的插件共用同一份环境。默认关:
+    "自报 env_id 即可共用"是一条隐式通道(两个目录不同的插件写同一个 env_id 就能
+    挤进同一份命名空间),现在必须显式声明才放行。
+    """
+    if not isinstance(manifest,dict):
+        return False
+    raw = manifest.get('share_env',False)
+    if raw is True:
+        return True
+    if raw not in (False,None):
+        print(f'插件 {name} 的 share_env 不是布尔值({raw!r}),按不共享处理')
+    return False
+
+
+def _shared_env_key(manifest):
+    """声明了 share_env 的插件用哪个键共享环境:自报 env_id,没写就用 'shared'。"""
+    raw = manifest.get('env_id','') if isinstance(manifest,dict) else ''
+    if isinstance(raw,str) and raw:
+        return raw
+    return 'shared'
+
 
 class Plugin_no_sandbox:
     def __init__(self,dir:str):
@@ -582,10 +644,18 @@ class Plugin_no_sandbox:
         self.name = n.get('name','')
         self.can_exec = n.get('can_exec',False)
         self.exec_path = n.get('exec_path',[])
+        # 插件身份 = 插件目录的规范化 realpath(与沙盒版 Plugin 同一口径)。
+        # 装载循环(load_music)对两种插件统一读 n.identity 做白名单判断与落盘,
+        # 本类以前只设了 env_id —— 关掉沙盒后每个插件都会在 n.identity 处抛
+        # AttributeError,被外层 except 吞成"加载插件 X 失败,已跳过",插件全装不上。
+        self.identity = os.path.normcase(os.path.realpath(dir))
+        # 环境命名空间默认按插件目录独立(identity)。只有 plugin.json 里显式写了
+        # "share_env": true,才按自报的 env_id(缺省 'shared')与别的插件共用同一份
+        # 命名空间 —— 没声明的插件即使写了 env_id 也不再共用(那条隐式通道已关闭)。
+        self.share_env = _plugin_share_env(n,self.name)
         # M12:env_id 不能默认 ''。多个插件都用 '' 时 env_dict.get('') 会拿到
-        # **同一份**命名空间,插件之间互相覆盖变量。这里退回按插件目录 realpath
-        # 生成的唯一键,与沙盒那侧的 identity 口径一致。
-        self.env_id = str(n.get('env_id','') or os.path.normcase(os.path.realpath(dir)))
+        # **同一份**命名空间,插件之间互相覆盖变量;identity 天然唯一。
+        self.env_id = _shared_env_key(n) if self.share_env else self.identity
         
     def init_env(self,env_dict:dict):
         box = env_dict.get(self.env_id,None)
@@ -631,6 +701,12 @@ class Plugin_no_sandbox:
 
     def run(self,tkaapp=None):
         if not self.can_exec or tkaapp is None:
+            return
+        # L8 的注释声称"init 没起来就不执行 command",但 run() 从来没读 init_ok:
+        # init 编译失败时 init_ok 保持 False 也拦不住这里,command 照样会在一个
+        # init 从未执行过的命名空间里 exec(通常直接 NameError)。装载流程
+        # (load_q/load_p)保证 init_i() 一定在 run() 之前被调用,所以直接判它即可。
+        if not self.init_ok:
             return
         self.env_dict['pro'] = tkaapp
         if not self.com:
@@ -687,7 +763,10 @@ class Player:
         self._pumping = False
 
         self._play_started = 0.0
-        self._short_plays = 0
+        # 短播计数按曲目键(_gate_key)分别记。原来是一个全局整数,于是"三首各自
+        # 只播了 0.3 秒的正常短音效(音效/试听切片)"会凑够 3,把第三首本身没
+        # 问题的歌拉黑并弹窗。
+        self._short_plays = {}
         # 上一次挂监听时用的 (path, end_action)。重扫列表会摘掉监听,
         # 需要靠它把"放完自动切歌"接回去(见 rearm_listen)。
         self._last_listen = None
@@ -753,10 +832,17 @@ class Player:
         # 放完就停住,再也不会自动切歌。路径以新列表为准。
         if self._last_listen is None:
             return False
-        if self.music_player.get_state() not in (vlc.State.Playing,vlc.State.Paused):
-            return False
         old_path,old_action = self._last_listen
         path = self._playable(self.music_message.get('name',''))
+        if self.music_player.get_state() not in (vlc.State.Playing,vlc.State.Paused):
+            # 窗口期:flush_music() 是"先 stop_listen() 摘掉监听 → 重建列表 →
+            # 再调本函数"。EndReached 如果恰好落在这两步之间,事件已经丢了,
+            # 此刻状态是 Ended/Stopped —— 原来这里直接 return False,于是那首歌
+            # 放完就永远停住,正是上面注释承诺要避免的情况。
+            # 这种情况照样补挂一次:只要这一首还在新列表里(path 非空)。
+            # 事件已经丢了、不会重放,多挂一次监听没有副作用。
+            if not path:
+                return False
         self._listen(path or old_path,
                      end_action if end_action is not None else old_action)
         return True
@@ -779,7 +865,13 @@ class Player:
                     keep.add(path)
         self._bad &= keep
         self._prompted &= keep
-        if self._settled and self._settled not in d:
+        if not isinstance(self._short_plays,dict):
+            self._short_plays = {}
+        self._short_plays = {k:v for k,v in self._short_plays.items() if k in keep}
+        # B8 的同一口径:_settled 里存的也可能是路径(_gate_key 在名字缺失时的
+        # 退化结果),拿它跟 d(键是曲目名)比会永远不命中,于是每次重扫都把
+        # "已处理"这扇闸门静默清空。与 _bad/_prompted 一样按 keep 比。
+        if self._settled and self._settled not in keep:
             self._settled = ''
         if not self._pumping:
             self._pumping = True
@@ -912,26 +1004,30 @@ class Player:
             if key and key not in self._prompted:
                 self._prompted.add(key)
                 ask = '无法打开音频,可能出现了问题,是否不允许播放'
-            self._short_plays = 0
+            self._short_plays.pop(key,None)
         elif time.monotonic() - self._play_started < 0.5:
-            self._short_plays += 1
-            if self._short_plays >= 3:
+            # 按曲目键分开计数(见 __init__ 的说明),不再用全局整数。
+            n = self._short_plays.get(key,0) + 1
+            self._short_plays[key] = n
+            if n >= 3:
                 # 数够了就清零:不管回答是"是"还是"否",都不能带着 3 这个计数
                 # 往下走,否则下一次事件又会立刻满足 >=3 再弹一次。
-                self._short_plays = 0
+                self._short_plays.pop(key,None)
                 if key and key not in self._prompted:
                     self._prompted.add(key)
                     ask = '音频可能出现问题,是否不允许播放'
         else:
-            self._short_plays = 0
+            self._short_plays.pop(key,None)
 
         if ask is not None:
             if self._ask_keep(label,ask):
                 self._bad.add(key)
                 print(f'{label} 无法正常播放,自动切歌不再选它')
-                self._set_status('播放失败:文件无法播放')
                 self._settled = key
                 self._stop()
+                # 顺序很重要:_stop() 内部会 _set_status('无')。原来把这句提示
+                # 放在它前面,刚压进队列就被"无"顶掉,用户实际看不到失败原因。
+                self._set_status('播放失败:文件无法播放')
                 if self.play_tt in (1,2):
                     # 拉黑之后没必要再重放这一首:顺序/随机模式直接切下一首。
                     self._advance_to(self._next_seq() if self.play_tt == 1 else self._next_random(),end_action)
@@ -942,8 +1038,9 @@ class Player:
             self._settled = key
             self._prompted.discard(key)
             print(f'{label} 播放异常,已按用户选择保留,停止自动重放,可手动重试或换一首')
-            self._set_status('播放异常:已停止自动重放')
             self._stop()
+            # 同上:_stop() 会写"无",这行必须排在它后面才看得见。
+            self._set_status('播放异常:已停止自动重放')
             return
 
         match self.play_tt:
@@ -1154,7 +1251,13 @@ class Player:
             self.music_photo = _default_photo()
             return
         try:
-            self.music_photo = Image.open(io.BytesIO(pic_data))
+            photo = Image.open(io.BytesIO(pic_data))
+            # 与 _default_photo 的 B9 修复同一口径:Image.open 只读文件头,头部
+            # 合法但数据被截断的封面不会在这里抛,异常会被推迟到 flush_display 的
+            # src.resize(...) —— 那是切歌路径上的裸调用,一旦抛出会顶掉
+            # _after_switch 之后的收尾。这里先强制解码一次,把坏封面就地降级。
+            photo.load()
+            self.music_photo = photo
         except Exception:
             logging.exception('解码内嵌封面失败,回退到默认封面')
             self.music_photo = _default_photo()
@@ -1540,16 +1643,20 @@ class Plugin:
 
         self.n = n
 
-        # env_id 用插件身份,不再听插件自报的 env_id:否则两个目录不同的插件
-        # 只要自报同一个 env_id 就能共用一个沙盒命名空间(H2)
-        self.env_id = self.identity
+        # 默认 env_id 就是插件身份,不听自报的 env_id:否则两个目录不同的插件
+        # 只要自报同一个 env_id 就能共用一个沙盒命名空间(H2)。
+        # 只有显式声明 "share_env": true 的插件,才按自报 env_id(缺省 'shared')
+        # 去共用同一个沙盒(见 env_box.create 的 share 参数)。
+        self.share_env = _plugin_share_env(n,self.name)
+        self.env_id = _shared_env_key(n) if self.share_env else self.identity
     def init_env(self):
 
         # 命名空间由沙盒提供:默认只给"读插件自己的目录",写/网络/进程都要授权。
         # 建沙盒要带宿主凭据:插件自己调 create 是改不动策略的
-        self._box = self.env_dict.create(self.identity,self.name,self.dir,
+        self._box = self.env_dict.create(self.env_id,self.name,self.dir,
                                          self.sandbox_policy,
-                                         _host_token=_HOST_TOKEN)
+                                         _host_token=_HOST_TOKEN,
+                                         share=self.share_env)
         self._env_dict = self._box.namespace
         self._env_dict['__start_sandbox__'] = start_sandbox
 
@@ -1590,6 +1697,10 @@ class Plugin:
 
     def run(self,tkaapp=None):
         if not self.can_exec or tkaapp is None:
+            return
+        # L8 的同一条:init 没起来就不该执行 command,否则 command 会在一个
+        # init 从未执行过的命名空间里 exec(通常直接 NameError)。
+        if not self.init_ok:
             return
         self._box.attach_host(tkaapp)
         if not self.com:
@@ -1732,8 +1843,17 @@ class Tkapp:
         self.information_frame.rowconfigure([0,1],weight=1)
         self.information_frame.columnconfigure([0,1],weight=1)
 
-        ph = ImageTk.PhotoImage(_default_photo()
-                                .resize((int(600/4),int(600/4))))
+        # _default_photo() 承诺"封面不可用时返回 None,绝不抛"(a.png 缺失或损坏),
+        # 但这里原来直接 .resize():None.resize 会让 Tkapp.__init__ 在启动路径上抛
+        # AttributeError,表现成"程序起不来"。封面拿不到就按无图处理。
+        ph = None
+        _ph_src = _default_photo()
+        if _ph_src is not None:
+            try:
+                ph = ImageTk.PhotoImage(_ph_src.resize((int(600/4),int(600/4))))
+            except Exception:
+                logging.exception('默认封面缩放失败,本次按无封面处理')
+                ph = None
         self.music_image = ttkbootstrap.Label(self.information_frame,image=ph)
         self.music_keep_not_clean = ph
         self.music_name = ttkbootstrap.Label(self.information_frame)
@@ -1886,18 +2006,21 @@ class Tkapp:
                 if not os.path.isfile(os.path.join(mn,'plugin.json')):continue
                 n = None
                 try:
-                    if start_sandbox:
+                    print(mn)
+                    if start_sandbox and mn not in self.config.close_safe_really_plugin:
                         n = Plugin(mn,self.env_dict,assigned_names)
-                    else: n=Plugin_no_sandbox(mn)
+                    else: n = Plugin_no_sandbox(mn)
                     
                     assigned_names.add(n.name)
                     if n.identity in self.config.allow_plugin:
                         # 沙盒策略在装载期一次定好(见 plugin_sandbox),插件自己改不了
-                        if start_sandbox:
+                        if start_sandbox and mn not in self.config.close_safe_really_plugin:
                             load_p(n)
-                        else:load_q(n)
+                        else:
+                            print(f'no sandbox load:{n.name}')
+                            load_q(n)
                     else:
-                        if start_sandbox:
+                        if start_sandbox and mn not in self.config.close_safe_really_plugin:
                             ask = (f'是否加载 {n.name}\n\n它申请的权限:\n'
                                f'{n.sandbox_policy.describe()}')
                         else:ask =f'是否加载 {n.name}'
