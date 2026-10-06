@@ -1,19 +1,24 @@
 from threading import Thread
 import tkinter,io,time,random,queue,platform,os,functools,sys,copy,traceback,json,logging,zipfile,tkinter.filedialog
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 本副本住在 dsh\,但 config.json / plugin\ / music\ / a.png / music.log 都在项目
+# 根,所以 BASE_DIR 必须指上一层 —— 原版是 __file__ 所在目录,直接搬过来会
+# 去 dsh\ 里找这些东西。
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if platform.system() == 'Windows':
-    os.environ['path'] += ';'+BASE_DIR
     os.environ['PYTHON_VLC_MODULE_PATH'] = f"{BASE_DIR}/pvlc"
-    os.environ['PYTHON_VLC_LIB_PATH'] = os.path.join(BASE_DIR, 'pvlc', 'libvlc.dll')
-    os.environ['PYTHON_VLC_MODULE_PATH'] = os.path.join(BASE_DIR, 'pvlc', 'plugins')
+# ---- 切换到精简版 pvlc_slim ----
+# 必须写在上面那两行之后:否则 Windows 分支又把插件目录指回完整版。
+# PYTHON_VLC_LIB_PATH 优先级最高(vlc.py:find_lib),DLL 和插件目录一起换掉,
+# 这样 pvlc\ 可以整个删掉,不用改任何其它代码。
+os.environ['PYTHON_VLC_LIB_PATH'] = os.path.join(BASE_DIR, 'pvlc_slim', 'libvlc.dll')
+os.environ['PYTHON_VLC_MODULE_PATH'] = os.path.join(BASE_DIR, 'pvlc_slim', 'plugins')
 try:
     from PIL import ImageTk,Image
     import pystray,ttkbootstrap,vlc
 except ModuleNotFoundError:
     logging.error(f'不是哥们,你是就安装了个python吗,给我去执行"pip install -r {BASE_DIR}{os.sep}requirements.txt"')
     sys.exit(1)
-print()
 start_music_message = True
 try:
     import mutagen
