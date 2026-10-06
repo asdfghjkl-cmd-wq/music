@@ -703,7 +703,11 @@ def _shared_env_key(manifest):
     raw = manifest.get('env_id','') if isinstance(manifest,dict) else ''
     if isinstance(raw,str) and raw:
         return raw
-    return 'shared'
+    try:
+        x = str(raw)
+        return x
+    except Exception:
+        return 'shared' 
 
 
 class Plugin_no_sandbox:
