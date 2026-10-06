@@ -1,6 +1,6 @@
 {
   "name": "sandbox_escape",
-  "can_exec": true,
+  "can_exec": false,
   "init_file": "a.py",
   "sandbox": {
     "fs_read": ["."],

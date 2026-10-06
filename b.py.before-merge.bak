@@ -1,5 +1,5 @@
 from threading import Thread
-import tkinter,io,time,random,queue,platform,os,functools,sys,copy,traceback,json,logging,zipfile,tkinter.filedialog
+import tkinter,io,time,random,queue,platform,os,functools,sys,copy,traceback,json,logging
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if platform.system() == 'Windows':
@@ -467,111 +467,6 @@ class Config:
         elif cap in ('net','proc'):
             g[cap] = True
         return g
-
-    # ---------------- 插件管理窗口用的读写 ----------------
-    # grant/deny 负责"记下一条授权",这里负责另一半:精确撤销。用户点的是
-    # "撤销这一条",不是"清空这个插件",所以每个方法只动目标条目,并且在条目
-    # 空掉之后顺手把空壳收掉 —— 否则 config.json 里会留一堆 {} 说明不了任何事。
-
-    def allow(self,name,flag=True):
-        """把插件加入/移出装载白名单(allow_plugin)。返回配置是否真的变了。"""
-        if flag and name not in self.allow_plugin:
-            self.allow_plugin.append(name)
-            return True
-        if not flag and name in self.allow_plugin:
-            self.allow_plugin.remove(name)
-            return True
-        return False
-
-    def set_unsafe(self,name,flag=True):
-        """plugin_unsafe:完全不受沙盒限制的名单。"""
-        if flag and name not in self.plugin_unsafe:
-            self.plugin_unsafe.append(name)
-            return True
-        if not flag and name in self.plugin_unsafe:
-            self.plugin_unsafe.remove(name)
-            return True
-        return False
-
-    def set_no_sandbox(self,name,flag=True):
-        """close_safe_really_plugin:名单里的插件不走沙盒直接跑(信任降级)。"""
-        if flag and name not in self.close_safe_really_plugin:
-            self.close_safe_really_plugin.append(name)
-            return True
-        if not flag and name in self.close_safe_really_plugin:
-            self.close_safe_really_plugin.remove(name)
-            return True
-        return False
-
-    def revoke(self,name,cap,target=None):
-        """撤销一条授权。target=None 表示整条能力(net/proc)。"""
-        g = self.plugin_grants.get(name)
-        if not g:
-            return False
-        if cap in ('fs:read','fs:write'):
-            key = 'fs_read' if cap == 'fs:read' else 'fs_write'
-            lst = g.get(key) or []
-            if target not in lst:
-                return False
-            lst.remove(target)
-            if not lst:
-                g.pop(key,None)
-        elif cap in ('net','proc'):
-            if g.pop(cap,None) is None:
-                return False
-        else:
-            return False
-        if not g:
-            self.plugin_grants.pop(name,None)
-        return True
-
-    def forget_deny(self,name,cap=None,target=None):
-        """清"不再询问":给了 cap 就清那一条,不给就整个插件清空。"""
-        g = self.plugin_deny.get(name)
-        if not g:
-            return False
-        if cap is None:
-            self.plugin_deny.pop(name,None)
-            return True
-        if cap in ('fs:read','fs:write'):
-            key = 'fs_read' if cap == 'fs:read' else 'fs_write'
-            lst = g.get(key) or []
-            if target not in lst:
-                return False
-            lst.remove(target)
-            if not lst:
-                g.pop(key,None)
-        elif cap in ('net','proc'):
-            if g.pop(cap,None) is None:
-                return False
-        else:
-            return False
-        if not g:
-            self.plugin_deny.pop(name,None)
-        return True
-
-    def set_modules(self,name,modules):
-        """写插件额外模块的放行清单;空清单等于撤销。"""
-        modules = [str(m) for m in (modules or []) if str(m)]
-        old = list(self.plugin_modules.get(name) or [])
-        if modules:
-            if old == modules:
-                return False
-            self.plugin_modules[name] = modules
-            return True
-        if name in self.plugin_modules:
-            self.plugin_modules.pop(name,None)
-            return True
-        return False
-
-    def plugin_view(self,name):
-        """摊平一个插件的全部授权,给管理窗口显示与逐条撤销用。"""
-        return {'allow': name in self.allow_plugin,
-                'unsafe': name in self.plugin_unsafe,
-                'no_sandbox': name in self.close_safe_really_plugin,
-                'grants': self.grants_for(name),
-                'denies': self.denies_for(name),
-                'modules': list(self.plugin_modules.get(name) or [])}
 
     def _backup_broken_config(self):
         """把读不出来的配置文件挪到带时间戳的 .bak,备份失败也不影响启动。
@@ -2026,13 +1921,71 @@ class Tkapp:
                 '写/网络/外部进程需要授权')
             print('\033[91m[warning]只能防老实的插件\n[warning]陌生插件还是发给gpt吧\033[0m',file=sys.stderr)
 
-        # 装载的真实逻辑已经提到方法上(_load_no_sandbox / _load_sandboxed),
-        # 这样「插件管理」窗口在运行期也能用同一套流程加载插件 —— 尤其是
-        # 沙盒"先恢复授权、再封存"的顺序,只该有一份实现。
         def load_q(n:Plugin_no_sandbox):
-            self._load_no_sandbox(n)
+            n.init_env(self.env__dict)
+            n.init_i(self)
+            self.plugin_list.append(n)
+            
+            def _bind(fn, _app=self):
+                return functools.partial(fn, _app)
+            
+            if 'play' in n.exec_path:
+                self.run_play_list.append(_bind(n.run))
+            if 'pause' in n.exec_path:
+                self.run_pause_list.append(_bind(n.run))
+            if 'listbox' in n.exec_path:
+                self.run_listbox_list.append(_bind(n.run))
         def load_p(n:Plugin):
-            self._load_sandboxed(n)
+            # 0) 先建沙盒:身份登记是 create() 内部完成的,identity_ok 这个结论
+            #    得先在 _box 上存在,下面 _confirm_identity 才读得到。原来这两行
+            #    是反的 —— _confirm_identity 读 n._box.identity_ok 时 _box 还是
+            #    __init__ 里那个 None,于是每个走沙盒的插件都抛
+            #    AttributeError: 'NoneType' object has no attribute 'identity_ok'。
+            #    次序换了并不削弱 fail-closed:此刻插件代码一行都还没执行
+            #    (init/command 都要等 mainloop),身份登记读到的就是磁盘原样,
+            #    登记失败照样在下一行被挡下,连 init_i 都不会走到。
+            n.init_env()
+            # 0.5) 身份登记失败(拿不到可信的代码来源)就不许跑,后续一切都不做
+            if not self._confirm_identity(n):
+                return
+            # 1) 把 config.json 里记住的授权喂回去(装载期、封存前)
+            for cap,target in self.config.grants_for(n.identity):
+                try:
+                    n._box.grant(cap,target,_host_token=_HOST_TOKEN)
+                except SandboxDenied as e:
+                    print(f'[沙盒] 恢复 {n.name} 的授权失败,已忽略:{e}')
+            # 1.5) 同样把"不再询问"恢复回去。缺了这一步,用户上次点过的
+            # "不再询问"重启后全部失效,同一个插件又被完整问一遍(L14)。
+            for cap,target in self.config.denies_for(n.identity):
+                try:
+                    n._box.remember_denied(cap,target,_host_token=_HOST_TOKEN)
+                except SandboxDenied as e:
+                    print(f'[沙盒] 恢复 {n.name} 的"不再询问"失败,已忽略:{e}')
+            # 2) unsafe 申请要用户确认过才真的放开
+            self._confirm_unsafe(n)
+            # 2.5) 额外模块同样要用户确认,且不受沙盒代理
+            self._confirm_modules(n)
+            # 3) 运行期要权限时问用户,并把"总是允许"写进 config.json
+            n._box.set_ask(self._plugin_ask)
+            # 持久化回调带上插件对象:沙盒侧只知道显示名,写配置要按 identity
+            n._box.set_persist(functools.partial(self._plugin_persist,n))
+            # L14:沙盒侧一直有 set_persist_deny 入口,宿主却没接 —— 用户点
+            # "不再询问"只在本次进程内有效,重启之后又问一遍。
+            n._box.set_persist_deny(functools.partial(self._plugin_persist_deny,n))
+            n.init_i(self)
+            self.plugin_list.append(n)
+            
+            def _bind(fn, _app=self):
+                return functools.partial(fn, _app)
+            
+            if 'play' in n.exec_path:
+                self.run_play_list.append(_bind(n.run))
+            if 'pause' in n.exec_path:
+                self.run_pause_list.append(_bind(n.run))
+            if 'listbox' in n.exec_path:
+                self.run_listbox_list.append(_bind(n.run))
+
+
         self.scrollbar.grid(row=0,column=1,sticky='n')
         self.down_frame_listbox.bind('<<ListboxSelect>>', self.change_music)
         if os.path.isdir(plugin_dir) and start_plugin:
@@ -2178,670 +2131,31 @@ class Tkapp:
         else:self.volume_var.set(n+10);self.player.set_volume(n+10);self.music_label.config(text=f"音量:{n+10}")
 
         return 'break'
-    # ---------------- 运行期加载插件 ----------------
-
-    def _bind_plugin_exec(self,n):
-        """按 exec_path 把插件的 run() 接到播放/暂停/列表刷新上。"""
-        def _bind(fn,_app=self):
-            return functools.partial(fn,_app)
-        if 'play' in n.exec_path:
-            self.run_play_list.append(_bind(n.run))
-        if 'pause' in n.exec_path:
-            self.run_pause_list.append(_bind(n.run))
-        if 'listbox' in n.exec_path:
-            self.run_listbox_list.append(_bind(n.run))
-
-    def _load_no_sandbox(self,n):
-        """无沙盒装载(原 __init__ 里的 load_q)。"""
-        n.init_env(self.env__dict)
-        n.init_i(self)
-        self.plugin_list.append(n)
-        self._bind_plugin_exec(n)
-        return True
-
-    def _load_sandboxed(self,n):
-        """沙盒装载(原 __init__ 里的 load_p);运行期加载也走这一条。
-
-        0) 先建沙盒:身份登记是 create() 内部完成的,identity_ok 这个结论得先在
-           _box 上存在,下面 _confirm_identity 才读得到。原来这两行是反的 ——
-           _confirm_identity 读 n._box.identity_ok 时 _box 还是 __init__ 里那个
-           None,于是每个走沙盒的插件都抛 AttributeError。次序换了并不削弱
-           fail-closed:此刻插件代码一行都还没执行,登记失败照样在下一行被挡下。
-
-        末尾比装载期多一步 seal:装载结束时宿主会 env_dict.seal() 把策略全部
-        冻住,而运行期新建的沙盒不在那一次遍历里 —— 不在这里补一刀,后加载的
-        这个插件就成了全场唯一策略还能改的沙盒。
-        """
-        n.init_env()
-        if not self._confirm_identity(n):
-            return False
-        for cap,target in self.config.grants_for(n.identity):
-            try:
-                n._box.grant(cap,target,_host_token=_HOST_TOKEN)
-            except SandboxDenied as e:
-                print(f'[沙盒] 恢复 {n.name} 的授权失败,已忽略:{e}')
-        for cap,target in self.config.denies_for(n.identity):
-            try:
-                n._box.remember_denied(cap,target,_host_token=_HOST_TOKEN)
-            except SandboxDenied as e:
-                print(f'[沙盒] 恢复 {n.name} 的"不再询问"失败,已忽略:{e}')
-        self._confirm_unsafe(n)
-        self._confirm_modules(n)
-        n._box.set_ask(self._plugin_ask)
-        n._box.set_persist(functools.partial(self._plugin_persist,n))
-        n._box.set_persist_deny(functools.partial(self._plugin_persist_deny,n))
-        n.init_i(self)
-        try:
-            n._box.seal()
-        except Exception:
-            logging.exception('运行期加载后封存沙盒失败')
-        self.plugin_list.append(n)
-        self._bind_plugin_exec(n)
-        return True
-
-    def _load_plugin_now(self,p):
-        """把 _scan_plugin_dirs() 扫出来的一项真正装进当前进程。
-
-        返回 (是否装上, 给用户看的一句说明)。
-        """
-        if p['loaded'] is not None:
-            return False,'它已经在跑了'
-        if not self.config.start_plugin:
-            return False,'"启用插件"关着,加载了也不会执行'
-        sandboxed = (bool(self.config.start_sandbox)
-                     and p['dir'] not in self.config.close_safe_really_plugin)
-        try:
-            if sandboxed:
-                n = Plugin(p['dir'],self.env_dict,
-                           {q.name for q in self.plugin_list})
-                if not self._load_sandboxed(n):
-                    return False,'身份登记没通过,已拒绝加载'
-            else:
-                n = Plugin_no_sandbox(p['dir'])
-                self._load_no_sandbox(n)
-        except Exception as e:
-            logging.exception('运行期加载插件失败')
-            return False,f'{type(e).__name__}: {e}'
-        return True,('已装载(沙盒模式)' if sandboxed else '已装载(无沙盒模式)')
-
-    @staticmethod
-    def _safe_plugin_dirname(name):
-        """zip 里的顶层目录名能不能直接拿来当插件目录名。"""
-        if not name or name in ('.','..') or len(name) > 64:
-            return False
-        if any(c in '<>:"/\\|?*' or ord(c) < 32 for c in name):
-            return False
-        return not name.endswith(('.',' '))
-
-    @staticmethod
-    def _inspect_plugin_zip(zip_path):
-        """只看不写:读出插件包的结构,给用户确认用。
-
-        格式约定与 dsh/q.zip 相同:包里是**一个顶层目录**,目录里放 plugin.json
-        和它的 init 文件 —— 等价于把 plugin/<名字>/ 整个打成一个包。
-
-        所有不安全的东西都在**解压之前**挡掉:绝对路径、能写到目标目录之外的
-        .. 条目、符号链接条目、散落在多个顶层目录下的文件、解开后过大的压缩
-        炸弹、缺失或非法的 plugin.json。
-        返回 (info, error);info 为 None 时 error 说明原因。
-        """
-        max_unpack = 32 * 1024 * 1024
-        try:
-            zf = zipfile.ZipFile(zip_path)
-        except Exception as e:
-            return None,f'不是能读的 zip:{e}'
-        with zf:
-            entries = []
-            total = 0
-            for item in zf.infolist():
-                name = item.filename.replace('\\','/')
-                if name.endswith('/'):
-                    continue
-                if name.startswith('/') or ':' in name.split('/')[0]:
-                    return None,f'包里有意外的绝对路径:{item.filename}'
-                parts = [part for part in name.split('/') if part not in ('','.')]
-                if not parts or '..' in parts:
-                    return None,f'包里有会写到目标目录之外的条目:{item.filename}'
-                if (item.external_attr >> 16) & 0o170000 == 0o120000:
-                    return None,f'包里有符号链接条目:{item.filename}'
-                total += item.file_size
-                if total > max_unpack:
-                    return None,f'解开后超过 {max_unpack // (1024 * 1024)} MB,不装'
-                entries.append(item)
-            if not entries:
-                return None,'这个包里没有文件'
-            tops = {item.filename.replace('\\','/').split('/')[0]
-                    for item in entries}
-            if len(tops) != 1:
-                return None,('包里必须是同一个顶层目录(与 dsh/q.zip 的格式一致),'
-                             f'实际有 {len(tops)} 个:{sorted(tops)}')
-            top = tops.pop()
-            if not Tkapp._safe_plugin_dirname(top):
-                return None,f'顶层目录名 {top!r} 不能用作插件目录名'
-            manifest_name = f'{top}/plugin.json'
-            if manifest_name not in zf.namelist():
-                return None,f'顶层目录 {top!r} 里没有 plugin.json'
-            try:
-                manifest = json.loads(zf.read(manifest_name).decode('utf-8'))
-            except Exception as e:
-                return None,f'plugin.json 读不出来:{e}'
-            if not isinstance(manifest,dict):
-                return None,'plugin.json 不是 JSON 对象'
-            return ({'dirname':top,'manifest':manifest,
-                     'target':os.path.join(BASE_DIR,'plugin',top),
-                     'count':len(entries),'bytes':total,'zip':zip_path},None)
-
-    @staticmethod
-    def _extract_plugin_zip(zip_path,target,dirname):
-        """把包里的内容解到 target。调用前 _inspect_plugin_zip 已经验过结构。
-
-        这里仍按同一套规则再过滤一遍:验过不等于可以松手 —— 写文件的这个循环
-        必须自己保证每个 dest 都落在 target 里。
-        """
-        prefix = dirname + '/'
-        try:
-            os.makedirs(target,exist_ok=True)
-            with zipfile.ZipFile(zip_path) as zf:
-                for item in zf.infolist():
-                    name = item.filename.replace('\\','/')
-                    if name.endswith('/'):
-                        continue
-                    if not name.startswith(prefix):
-                        return False,f'条目不在顶层目录里,已中止:{item.filename}'
-                    rel = name[len(prefix):]
-                    if not rel or '..' in rel.split('/'):
-                        return False,f'条目路径可疑,已中止:{item.filename}'
-                    dest = os.path.join(target,rel)
-                    parent = os.path.dirname(dest)
-                    if parent:
-                        os.makedirs(parent,exist_ok=True)
-                    with zf.open(item) as src, open(dest,'wb') as fp:
-                        while True:
-                            chunk = src.read(65536)
-                            if not chunk:
-                                break
-                            fp.write(chunk)
-        except Exception as e:
-            logging.exception('解压插件包失败')
-            return False,f'{type(e).__name__}: {e}'
-        return True,''
-
-    # ---------------- 插件管理窗口 ----------------
-
-    def _scan_plugin_dirs(self):
-        """扫 plugin/ 下所有"有 plugin.json"的目录,不管它这次有没有被装载。
-
-        管理界面必须以磁盘为准:没被装载的插件同样要能启用、能看权限,否则用户
-        第一次想启用某个插件就只能等启动时那个弹窗。identity 用和 Plugin /
-        Plugin_no_sandbox 完全相同的口径算,里面的授权才认得出来。
-        """
-        out = []
-        loaded = {}
-        for p in (getattr(self,'plugin_list',None) or []):
-            ident = getattr(p,'identity',None)
-            if ident:
-                loaded[ident] = p
-        plugin_dir = os.path.join(BASE_DIR,'plugin')
-        try:
-            entries = sorted(os.listdir(plugin_dir))
-        except OSError:
-            logging.exception('扫描 plugin 目录失败')
-            return out
-        for entry in entries:
-            full = os.path.join(plugin_dir,entry)
-            if not os.path.isdir(full):
-                continue
-            manifest_path = os.path.join(full,'plugin.json')
-            if not os.path.isfile(manifest_path):
-                continue
-            manifest = {}
-            try:
-                with open(manifest_path,'r',encoding='utf-8') as fp:
-                    manifest = json.load(fp)
-            except Exception:
-                logging.exception('读取插件配置失败')
-                manifest = {}
-            if not isinstance(manifest,dict):
-                manifest = {}
-            name = manifest.get('name') or entry
-            if not isinstance(name,str) or not name:
-                name = entry
-            identity = os.path.normcase(os.path.realpath(full))
-            out.append({'dir':full,'identity':identity,'name':name,
-                        'folder':entry,'manifest':manifest,
-                        'loaded':loaded.get(identity)})
-        return out
-
-    @staticmethod
-    def _policy_text(manifest):
-        """把 plugin.json 的 sandbox 段压成一行"它申请什么",给列表当摘要列。"""
-        sb = manifest.get('sandbox')
-        if not isinstance(sb,dict):
-            sb = {}
-        legacy = manifest.get('privilege')
-        legacy = legacy if isinstance(legacy,(list,tuple)) else ()
-        bits = []
-        rd = sb.get('fs_read')
-        rd = list(rd) if isinstance(rd,(list,tuple)) and rd else ['.']
-        bits.append('读:'+','.join(str(x) for x in rd))
-        wr = sb.get('fs_write')
-        if isinstance(wr,(list,tuple)) and wr:
-            bits.append('写:'+','.join(str(x) for x in wr))
-        if sb.get('net'):
-            bits.append('网络')
-        if sb.get('proc'):
-            bits.append('进程')
-        if sb.get('unsafe') or 'no_sandbox_really' in legacy:
-            bits.append('完全不受限')
-        mods = sb.get('modules')
-        if isinstance(mods,(list,tuple)) and mods:
-            bits.append('模块:'+','.join(str(x) for x in mods))
-        return ' · '.join(bits)
-
-    @staticmethod
-    def _read_can_exec(manifest):
-        """插件自己声明的 can_exec(缺省 False,与 Plugin.__init__ 同口径)。
-
-        宿主在两个地方按它拦人:Plugin.init_i 和 Plugin.run 一进门就是
-        `if not self.can_exec: return`。所以 can_exec=False 的插件一行代码都
-        不会执行 —— 这才是"停用"该动的地方。
-        """
-        return bool(manifest.get('can_exec',False))
-
-    @staticmethod
-    def _write_can_exec(manifest_path,enabled):
-        """只改 plugin.json 里 can_exec 这一个值,其余内容原样保留。
-
-        刻意不用 json.load + json.dump 重写:那会把作者手写的缩进和键的顺序
-        一起抹平,一个"扳开关"的动作不该动整份文件。字段不存在时只有"启用"
-        需要补 —— 缺省就是 False,见 Plugin.__init__ 的 n.get('can_exec',False)。
-
-        读写都用 newline='':不能让 Python 顺手把 CRLF 换成 LF,那也算改文件。
-        返回 (配置是否真的变了, 给用户看的一句说明)。
-        """
-        want = 'true' if enabled else 'false'
-        try:
-            with open(manifest_path,'r',encoding='utf-8',newline='') as fp:
-                text = fp.read()
-        except OSError as e:
-            return False,f'读不了 plugin.json:{e}'
-        try:
-            data = json.loads(text)
-        except Exception as e:
-            return False,f'plugin.json 不是合法 JSON,没敢改:{e}'
-        if not isinstance(data,dict):
-            return False,'plugin.json 不是 JSON 对象,没敢改'
-        if bool(data.get('can_exec',False)) == bool(enabled):
-            return False,'已经是这个状态了'
-
-        idx = text.find('"can_exec"')
-        if idx != -1:
-            colon = text.find(':',idx + len('"can_exec"'))
-            if colon == -1:
-                return False,'plugin.json 里的 can_exec 看不懂,没敢改'
-            start = colon + 1
-            while start < len(text) and text[start] in ' \t':
-                start += 1
-            end = start
-            while end < len(text) and text[end] not in ',}\r\n':
-                end += 1
-            if text[start:end].strip() not in ('true','false'):
-                return False,'can_exec 的值不是 true/false,没敢改'
-            new_text = text[:start] + want + text[end:]
-        else:
-            if not enabled:
-                return False,'plugin.json 里没有 can_exec(缺省就是不启用),不用改'
-            brace = text.find('{')
-            if brace == -1:
-                return False,'plugin.json 里找不到对象起始的 {,没敢改'
-            new_text = text[:brace+1] + f'\n  "can_exec": {want},' + text[brace+1:]
-
-        try:
-            with open(manifest_path,'w',encoding='utf-8',newline='') as fp:
-                fp.write(new_text)
-        except OSError as e:
-            return False,f'写不回 plugin.json:{e}'
-        return True,f'can_exec 已改成 {want}'
-
     def plugin_setting(self):
-        """插件管理:启停、看权限、逐条撤销、单个插件切沙盒。
-
-        两个开关是分开的,别混:
-          * 「启用/停用」写插件自己的 plugin.json(can_exec)—— 真开关,
-            can_exec=False 的插件一行代码都不会执行;
-          * 「免询问」写 config.json(allow_plugin)—— 只管启动时问不问,
-            动它拦不住任何插件,点了"是"照样装上。
-
-        两条贯穿全窗口的原则:
-          * 收紧方向(停用 / 撤销授权 / 取消不受限)直接生效,不拦着用户;
-          * 放宽方向(启用 / 无沙盒 / 额外模块)要二次确认,而且只写配置 ——
-            正在跑的那个插件在这一进程里不会被"就地放权",一切等重启后按新的
-            plugin.json / config.json 装载。沙盒在装载结束时就封存了,改不动。
-        """
-        ui = ttkbootstrap.Toplevel('插件管理',size=(900,640))
-        ui.minsize(720,520)
-        state = {'plugins':[], 'entries':[]}
-        dirty = {'v':False}
-
-        top = ttkbootstrap.Frame(ui)
-        top.pack(fill='x',padx=12,pady=(10,4))
-        start_plugin_var = tkinter.BooleanVar(value=self.config.start_plugin)
-        start_sandbox_var = tkinter.BooleanVar(value=self.config.start_sandbox)
-        ttkbootstrap.Checkbutton(top,text='启用插件',variable=start_plugin_var,
-                                 onvalue=True,offvalue=False).pack(side='left')
-        ttkbootstrap.Checkbutton(top,text='启用沙盒',variable=start_sandbox_var,
-                                 onvalue=True,offvalue=False).pack(side='left',padx=(12,0))
-        ttkbootstrap.Label(top,text='改动写入 config.json / plugin.json,重启后生效').pack(side='right')
-
-        list_box = ttkbootstrap.Frame(ui)
-        list_box.pack(fill='both',expand=True,padx=12)
-        tree = ttkbootstrap.Treeview(list_box,
-                                     columns=('enabled','name','status','mode','ask','policy'),
-                                     show='headings',height=10)
-        for key,text,width,anchor in (('enabled','启用',52,'center'),
-                                      ('name','插件',150,'w'),
-                                      ('status','状态',64,'center'),
-                                      ('mode','运行模式',130,'w'),
-                                      ('ask','免询问',62,'center'),
-                                      ('policy','申请的权限',330,'w')):
-            tree.heading(key,text=text)
-            tree.column(key,width=width,anchor=anchor,stretch=(key=='policy'))
-        tsb = ttkbootstrap.Scrollbar(list_box,orient='vertical',command=tree.yview)
-        tree.configure(yscrollcommand=tsb.set)
-        tsb.pack(side='right',fill='y')
-        tree.pack(side='left',fill='both',expand=True)
-
-        ttkbootstrap.Label(ui,text='选中插件的权限(在下面选一条即可撤销)',
-                           anchor='w').pack(fill='x',padx=12,pady=(10,2))
-        detail_box = ttkbootstrap.Frame(ui)
-        detail_box.pack(fill='both',expand=True,padx=12)
-        etree = ttkbootstrap.Treeview(detail_box,
-                                      columns=('kind','cap','target'),
-                                      show='headings',height=7)
-        for key,text,width,anchor in (('kind','类型',120,'center'),
-                                      ('cap','能力',120,'center'),
-                                      ('target','目标',540,'w')):
-            etree.heading(key,text=text)
-            etree.column(key,width=width,anchor=anchor,stretch=(key=='target'))
-        esb = ttkbootstrap.Scrollbar(detail_box,orient='vertical',command=etree.yview)
-        etree.configure(yscrollcommand=esb.set)
-        esb.pack(side='right',fill='y')
-        etree.pack(side='left',fill='both',expand=True)
-
-        status = ttkbootstrap.Label(ui,text='',anchor='w')
-        status.pack(fill='x',padx=12,pady=(8,0))
-        foot = ttkbootstrap.Frame(ui)
-        foot.pack(fill='x',padx=12,pady=10)
-
-        def say(text):
-            status.configure(text=text)
-
-        def selected_plugin():
-            sel = tree.selection()
-            if not sel:
-                return None
-            for p in state['plugins']:
-                if p['identity'] == sel[0]:
-                    return p
-            return None
-
-        def refresh_plugins(keep=None):
-            if keep is None:
-                keep = tree.selection()
-            for item in tree.get_children():
-                tree.delete(item)
-            state['plugins'] = self._scan_plugin_dirs()
-            for p in state['plugins']:
-                view = self.config.plugin_view(p['identity'])
-                mode = '无沙盒' if view['no_sandbox'] else '沙盒'
-                if view['unsafe']:
-                    mode += ' + 完全不受限'
-                tree.insert('','end',iid=p['identity'],values=(
-                    '✓' if self._read_can_exec(p['manifest']) else '',
-                    p['name'],
-                    '已装载' if p['loaded'] is not None else '未装载',
-                    mode,
-                    '✓' if view['allow'] else '',
-                    self._policy_text(p['manifest'])))
-            for ident in (keep or ()):
-                if tree.exists(ident):
-                    tree.selection_set(ident)
-                    break
-
-        def refresh_entries():
-            for item in etree.get_children():
-                etree.delete(item)
-            state['entries'] = []
-            p = selected_plugin()
-            if p is None:
-                return
-            view = self.config.plugin_view(p['identity'])
-
-            def add(kind,cap,target,text):
-                i = str(len(state['entries']))
-                state['entries'].append({'kind':kind,'cap':cap,'target':target})
-                etree.insert('','end',iid=i,
-                             values=(text,cap,target if target else '(整个能力)'))
-
-            if view['unsafe']:
-                add('unsafe','unsafe',None,'完全不受限')
-            for cap,target in view['grants']:
-                add('grant',cap,target,'已授权')
-            for cap,target in view['denies']:
-                add('deny',cap,target,'不再询问')
-            for m in view['modules']:
-                add('module','modules',m,'额外模块')
-
-        def apply_change(changed,text):
-            if not changed:
-                say('这一项没有变化')
-                return False
-            self.config.save()
-            dirty['v'] = True
-            say(text + '(已写入 config.json,重启后生效)')
-            return True
-
-        def on_pick(_event=None):
-            refresh_entries()
-            p = selected_plugin()
-            if p is not None:
-                switch = '启用' if self._read_can_exec(p['manifest']) else '停用'
-                ask = '免询问' if self.config.plugin_view(p['identity'])['allow'] else '每次询问'
-                say(f'{p["name"]}({p["folder"]}) — {switch} · {ask} · '
-                    f'{self._policy_text(p["manifest"])}')
-
-        def toggle_enabled():
-            """启用/停用 = 直接改插件自己的 can_exec。
-
-            这才是真开关:can_exec=False 时 Plugin.init_i / run 一进门就返回,
-            插件一行代码都不会跑。改 allow_plugin 只是让它下次启动再问一遍,
-            用户点"是"照样装上 —— 那不叫停用,原来的实现就栽在这。
-            """
-            p = selected_plugin()
-            if p is None:
-                say('先在上面选一个插件')
-                return
-            want = not self._read_can_exec(p['manifest'])
-            if want:
-                ans = ttkbootstrap.Messagebox.yesno(
-                    f'启用「{p["name"]}」?\n\n它申请的权限:\n'
-                    f'{self._policy_text(p["manifest"])}\n\n'
-                    '这会把插件自己的 plugin.json 里 can_exec 改成 true。',
-                    '启用插件',parent=ui,buttons=['启用','取消'])
-                if ans != '启用':
-                    return
-            changed,detail = self._write_can_exec(
-                os.path.join(p['dir'],'plugin.json'),want)
-            if not changed:
-                say(f'没改动:{detail}')
-            else:
-                dirty['v'] = True
-                say(f'「{p["name"]}」已{"启用" if want else "停用"}'
-                    f'({detail};重启后生效)')
-            refresh_plugins()
-            refresh_entries()
-
-        def toggle_allow():
-            """免询问开关 = allow_plugin:在名单里,启动时不再问"是否加载"。
-
-            它和"启用/停用"是两件事,所以这里不碰 can_exec —— 一个插件可以是
-            "启用但每次都要问",也可以是"免询问但仍然不启用"。
-            """
-            p = selected_plugin()
-            if p is None:
-                say('先在上面选一个插件')
-                return
-            view = self.config.plugin_view(p['identity'])
-            if view['allow']:
-                apply_change(self.config.allow(p['identity'],False),
-                             f'「{p["name"]}」已移出免询问名单(下次启动还会问)')
-            else:
-                apply_change(self.config.allow(p['identity'],True),
-                             f'「{p["name"]}」已加入免询问名单(下次启动直接加载)')
-            refresh_plugins()
-            refresh_entries()
-
-        def toggle_no_sandbox():
-            p = selected_plugin()
-            if p is None:
-                say('先在上面选一个插件')
-                return
-            view = self.config.plugin_view(p['identity'])
-            if view['no_sandbox']:
-                apply_change(self.config.set_no_sandbox(p['identity'],False),
-                             f'「{p["name"]}」已改回沙盒模式')
-            else:
-                ans = ttkbootstrap.Messagebox.yesno(
-                    f'让「{p["name"]}」以无沙盒模式运行?\n\n'
-                    '它的代码将直接跑在播放器进程里:不再判权、不再问权限,\n'
-                    '和播放器本身一样可信。这比"完全不受限"更彻底 ——\n'
-                    '后者至少还留着审计钩子。',
-                    '信任降级',parent=ui,buttons=['我明白,继续','取消'])
-                if ans != '我明白,继续':
-                    return
-                apply_change(self.config.set_no_sandbox(p['identity'],True),
-                             f'「{p["name"]}」已标记为无沙盒运行')
-            refresh_plugins()
-            refresh_entries()
-
-        def revoke():
-            p = selected_plugin()
-            sel = etree.selection()
-            if p is None or not sel:
-                say('先在下面选一条权限')
-                return
-            e = state['entries'][int(sel[0])]
-            ident = p['identity']
-            if e['kind'] == 'unsafe':
-                changed = self.config.set_unsafe(ident,False)
-                what = '完全不受限'
-            elif e['kind'] == 'grant':
-                changed = self.config.revoke(ident,e['cap'],e['target'])
-                what = f'{e["cap"]} {e["target"] or ""}'
-            elif e['kind'] == 'deny':
-                changed = self.config.forget_deny(ident,e['cap'],e['target'])
-                what = f'{e["cap"]} {e["target"] or ""}(不再询问)'
-            elif e['kind'] == 'module':
-                left = [m for m in (self.config.plugin_modules.get(ident) or [])
-                        if m != e['target']]
-                changed = self.config.set_modules(ident,left)
-                what = f'额外模块 {e["target"]}'
-            else:
-                changed = False
-                what = '未知项'
-            if changed:
-                apply_change(True,f'已撤销「{p["name"]}」的 {what}')
-            refresh_plugins()
-            refresh_entries()
-
-        def forget_all_deny():
-            p = selected_plugin()
-            if p is None:
-                say('先在上面选一个插件')
-                return
-            apply_change(self.config.forget_deny(p['identity']),
-                         f'已清掉「{p["name"]}」的全部"不再询问"')
-            refresh_entries()
-
-        def _ask(message,title,buttons):
-            try:
-                return ttkbootstrap.Messagebox.yesno(message,title,
-                                                     parent=ui,buttons=buttons)
-            except Exception:
-                logging.exception('确认框弹不出来,按取消处理')
-                return buttons[-1]
-
-        def _warn(title,message):
-            print(f'[插件] {title}:{message}')
-            try:
-                ttkbootstrap.Messagebox.show_warning(message,parent=ui)
-            except Exception:
-                logging.exception('提示框弹不出来')
-
-        def load_from_zip():
-            """从插件包装一个进来,并立刻加载到当前进程。
-
-            包格式与 dsh/q.zip 一致:一个顶层目录,里面是 plugin.json 和它的
-            init 文件。先读后写 —— 包结构不对、路径可疑、目标已存在,统统在
-            解压之前拦下,不会先落一堆文件再报错。
-            """
-            path = tkinter.filedialog.askopenfilename(
-                title='选择插件包(zip)',parent=ui,
-                filetypes=[('插件包','*.zip'),('所有文件','*.*')])
-            if not path:
-                return
-            info,error = self._inspect_plugin_zip(path)
-            if error:
-                _warn('这个包不能装',error)
-                say(error)
-                return
-            target = info['target']
-            if os.path.exists(target):
-                if _ask(f'插件目录已经存在:\n{target}\n\n覆盖它?',
-                        '已存在',['覆盖','取消']) != '覆盖':
-                    return
-            name = info['manifest'].get('name') or info['dirname']
-            if _ask(f'装这个插件?\n\n包:{os.path.basename(path)}\n'
-                    f'插件名:{name}\n'
-                    f'会解到:{target}\n'
-                    f'内容:{info["count"]} 个文件,约 {max(1,info["bytes"] // 1024)} KB\n\n'
-                    f'它申请的权限:\n{self._policy_text(info["manifest"])}\n\n'
-                    '装好会立刻加载:里面的代码会被执行。',
-                    '加载插件',['装并加载','取消']) != '装并加载':
-                return
-            ok,detail = self._extract_plugin_zip(path,target,info['dirname'])
-            if not ok:
-                _warn('解压失败',detail)
-                say(detail)
-                return
-            refresh_plugins()
-            fresh = None
-            for p in state['plugins']:
-                if p['dir'] == target:
-                    fresh = p
-                    break
-            if fresh is None:
-                _warn('装好了但没扫到',
-                      'zip 解开后没在 plugin/ 里找到它,检查一下包结构。')
-                return
-            loaded,detail = self._load_plugin_now(fresh)
-            refresh_plugins()
-            refresh_entries()
-            if tree.exists(fresh['identity']):
-                tree.selection_set(fresh['identity'])
-                refresh_entries()
-            if loaded:
-                say(f'「{fresh["name"]}」{detail}'
-                    '(想让它下次启动不再问,点"免询问开关")')
-            else:
-                say(f'已解到 plugin/{info["dirname"]},但没加载:{detail}')
-
-        def close():
+        ui = ttkbootstrap.Toplevel('plugin setting',size=(300,400))
+        n = tkinter.BooleanVar(value=self.config.start_plugin)
+        f = tkinter.BooleanVar(value=self.config.start_sandbox)
+        a=ttkbootstrap.Checkbutton(ui,text='启用插件',variable=n,onvalue=True,offvalue=False)
+        p=ttkbootstrap.Checkbutton(ui,text='启用沙盒',variable=f,onvalue=True,offvalue=False)
+        a.pack()
+        p.pack()
+        x = {}
+        for m in self.plugin_list:
+            x[m.name] = m
+        def save():
             was = self.config.start_sandbox
-            self.config.start_plugin = bool(start_plugin_var.get())
-            self.config.start_sandbox = bool(start_sandbox_var.get())
+            self.config.start_plugin = n.get()
+            self.config.start_sandbox = f.get() 
             self.config.save()
+            
+
+
+            
+            
+            
+            
             if bool(was) != bool(self.config.start_sandbox):
+
                 if self.config.start_sandbox:
                     msg = '沙盒已开启,需要重启程序才生效。'
                 else:
@@ -2849,25 +2163,7 @@ class Tkapp:
                            '关闭后插件代码将直接运行在宿主环境中,不再有任何权限限制。')
                 ttkbootstrap.Messagebox.show_warning(msg,parent=ui)
             ui.destroy()
-
-        ttkbootstrap.Button(foot,text='启用/停用',
-                            command=toggle_enabled).pack(side='left')
-        ttkbootstrap.Button(foot,text='免询问开关',
-                            command=toggle_allow).pack(side='left',padx=6)
-        ttkbootstrap.Button(foot,text='沙盒/无沙盒',
-                            command=toggle_no_sandbox).pack(side='left',padx=6)
-        ttkbootstrap.Button(foot,text='撤销选中权限',
-                            command=revoke).pack(side='left',padx=6)
-        ttkbootstrap.Button(foot,text='清空"不再询问"',
-                            command=forget_all_deny).pack(side='left')
-        ttkbootstrap.Button(foot,text='加载插件…',
-                            command=load_from_zip).pack(side='right',padx=6)
-        ttkbootstrap.Button(foot,text='关闭',command=close).pack(side='right')
-
-        tree.bind('<<TreeviewSelect>>',on_pick)
-        refresh_plugins()
-        refresh_entries()
-
+        ttkbootstrap.Button(ui,text="保存",command=save).pack()
     def _pump_ui(self):
 
         try:
