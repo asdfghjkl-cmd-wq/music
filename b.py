@@ -1,6 +1,6 @@
 from threading import Thread
 import tkinter,io,time,random,queue,platform,os,functools,sys,copy,traceback,json,logging,zipfile,tkinter.filedialog
-
+#1!
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if platform.system() == 'Windows':
     os.environ['path'] += ';'+BASE_DIR
@@ -57,7 +57,7 @@ def _close_quietly(obj,what):
 
 _DEFAULT_PHOTO = None
 _DEFAULT_PHOTO_TRIED = False
-
+#2!
 def _default_photo():
     """a.png 的模块级惰性单例:只 Image.open 一次,之后复用同一个对象。
 
@@ -657,7 +657,7 @@ if start_plugin and start_sandbox:
 
 
 NO_FILE = 'no<>found*.mp3*.mp4..'
-
+#3!
 def _plugin_data_path(dir,rel,key):
     """把 plugin.json 里的 init_file/command_file 解析成一个安全的绝对路径。
 
@@ -838,12 +838,12 @@ class Plugin_no_sandbox:
                 print(f'插件 {self.name} 执行失败:{e}')
                 traceback.print_exc()
         tkaapp.app.after(0,_run_command)
-
+#4!
 # M14:状态文字走队列用的哨兵。Player._pending 里正常压的是
 # (path,end_action,gen,failed) 四元组;这里用模块级对象占第一位,
 # 不会与任何真实路径相等,也不受"代"(gen)作废的影响。
 _STATUS = object()
-
+#5!
 class Player:
     def __init__(self,d:dict): 
         params = [
@@ -1539,7 +1539,7 @@ def fmt_time(ms):
 
 # env_box 现在来自 plugin_sandbox.py:每个 env_id 一个沙盒,命名空间里的
 # os/sys/io/socket/... 都是受控门面,默认只允许读插件自己的目录。
-
+#6!
 
     
 
@@ -1658,7 +1658,7 @@ class SeekBar(ttkbootstrap.Frame):
             self.label.config(text=f"{fmt_time(cur)} / {fmt_time(self._total)}")
         else:
             self.label.config(text="00:00 / 00:00")
-
+#7!
 
 class Plugin:
     def __init__(self,dir:str,env_dict:env_box,other_names=None):
@@ -1840,7 +1840,7 @@ class Plugin:
         tkaapp.app.after(0,_run_command)
 
 
-
+#8!
 
 
 
@@ -2520,6 +2520,14 @@ class Tkapp:
         except OSError as e:
             return False,f'写不回 plugin.json:{e}'
         return True,f'can_exec 已改成 {want}'
+
+    def set_value(self,name,value):
+        x = ttkbootstrap.Messagebox.yesno(f'插件请求更改{name}变量为{value},是否允许','player_plugin',buttons=['不要','行'])
+
+        if x == '行':
+            vars(self)[name] = value
+        else:raise SandboxDenied
+        
 
     def plugin_setting(self):
         """插件管理:启停、看权限、逐条撤销、单个插件切沙盒。
@@ -3286,7 +3294,7 @@ class Tkapp:
     def run(self):
         self.app.mainloop()
 
-
+#9!
 def main():
     # 日志已在模块级按 __main__ 条件装好(见 _setup_logging),这里只兜一次底:
     # 万一是被别的方式拉起来的,也要保证日志落到 music.log。
@@ -3301,7 +3309,7 @@ def main():
     pro.app.focus_get()
     pro.run()
 
-    
+#10!
 
 pro:Tkapp
 __env_id__:str
@@ -3316,3 +3324,4 @@ if __name__ == "__main__":
 
         traceback.print_exc()
         raise SystemExit(1)
+#11!

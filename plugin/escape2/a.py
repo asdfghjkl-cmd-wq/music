@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""plugin/escape2 —— 第三批越权样本:判权/审计依赖的**模块 globals** 可写(2026-10)
+r"""plugin/escape2 —— 第三批越权样本:判权/审计依赖的**模块 globals** 可写(2026-10)
 
 它不是给人用的插件。默认 can_exec=true 只是为了让 dsh/escape2_selftest.py 能自动
 装载它;真实播放器里只有名字进了 config.json 的 allow_plugin 才会加载 —— 别加进去。
@@ -12,18 +12,25 @@
 
     g = type(__sandbox__).__init__.__globals__
 
-实测能真的走出去的路(每条都对应 report() 里的一个 step):
+第三批当初登记的手法(每条都对应 report() 里的一个 step)。
 
-| 手法 | 为什么成立 |
-|---|---|
-| `g['_FRAME_LOCAL'].depth = 5` | 审计钩子第一句 `if getattr(_depth,'depth',0): return`,置位后**第二道闸全局失明** |
-| 往 `g['_AUTH'][id(box)]['session']` 里塞 `C:\\` | 记账表是普通 dict,`_auth_domain` 读的就是它 |
-| `g['_auth_entry'] = <unsafe 记账>` | 钩子和门面都按**全局名**查找 `_auth_entry` |
-| `g['under'] = lambda r,p: True` | `_auth_can` 里的 `any(under(r,target) ...)` 也是全局名查找 |
-| 清 `_FRAME_TAGS`/`_FRAME_DIRS` + `g['_frame_registrar'].count = 0` | 防篡改靠计数比对,先归零再清表,钩子就认不出插件帧 |
+**2026-10 复核结论:下面这几条现在全部 BLOCK**(实测见 report() 的"第二段"),
+也就是说这张表记的是"当初为什么成立",不再是"现在还能走"。第 8/9 批加固给插件
+code 建了身份账本、给帧注册表加了记账与 rebuild,判权也改成只认基线与快照里的根,
+这几条因此一起失效。唯一还"OK"的是 01/02 两步纯内省(拿到 SandBox 与模块 globals、
+偷到 `_HOST_TOKEN`)—— 拿得到,但用不出去。
 
-根因:`install_audit_hook()` 只把**对象引用**收进了闭包 —— `_AUTH` 的**内容**、
-`_auth_entry`/`under` 这些**函数本身**都不是闭包变量。
+| 手法 | 当初为什么成立 | 现在(2026-10 复核) |
+|---|---|---|
+| `g['_FRAME_LOCAL'].depth = 5` | 审计钩子第一句 `if getattr(_depth,'depth',0): return`,置位后**第二道闸全局失明** | **BLOCK**:`install_audit_hook()` 里仍捕获 `_depth`,但 `_hook` 已不读它(见 `step_06`) |
+| 往 `g['_AUTH'][id(box)]['session']` 里塞 `C:\` | 记账表是普通 dict,`_auth_domain` 读的就是它 | **BLOCK**:`_auth_domain` 的 `keep` 只保留基线/快照里已有的根,新塞的被过滤掉(见 `step_07`) |
+| `g['_auth_entry'] = <unsafe 记账>` | 钩子和门面都按**全局名**查找 `_auth_entry` | **BLOCK**:判权读的是模块私有的那份记账(见 `step_09`) |
+| `g['under'] = lambda r,p: True` | `_auth_can` 里的 `any(under(r,target) ...)` 也是全局名查找 | **BLOCK**:同上(见 `step_08`) |
+| 清 `_FRAME_TAGS`/`_FRAME_DIRS` + `g['_frame_registrar'].count = 0` | 防篡改靠计数比对,先归零再清表,钩子就认不出插件帧 | **BLOCK**:`tampered()` 认 `_forced` 标志,钩子按记账 rebuild 后继续正常判权(见 `step_10`) |
+| 伪造 `co_filename` + 新线程 | 帧识别靠 `co_filename`,而插件能自己指定它 | **BLOCK**:插件 code 进账本后按 **code 对象身份**认帧,伪造的名字只留一条 `fake_frame`(见 `step_12`) |
+
+根因(当初):`install_audit_hook()` 只把**对象引用**收进了闭包 —— `_AUTH` 的
+**内容**、`_auth_entry`/`under` 这些**函数本身**都不是闭包变量。
 
 约定(照 plugin/escape):
     * 只做**只读**动作 + 一次 `echo` 起进程 + 一次"写完立刻删"的越权写探针;
@@ -32,7 +39,10 @@
     * 判定只看"越权动作有没有成功",不看"改没改成"。
 
 已知缺口(方案固有上限,SANDBOX.md 已写明,不在这里修):
-`os.stat`/`os.lstat` 无审计事件、`os.environ` 可读、`pro.app._app` 穿透、Tcl 通道。
+`os.stat`/`os.lstat` 无审计事件、`os.environ` 可读、同进程内省
+(`__sandbox__.can.__closure__[...]` / `type(__sandbox__).__init__.__globals__`)。
+(门面的 `pro.app._app` 穿透与 Tcl 通道已由门面加固 A/B/D 堵住 ——
+见 plugin/escape3 与 plugin/escape4。)
 """
 
 import json
@@ -59,8 +69,22 @@ def _rec(step, verdict, detail=''):
 
 
 def _box():
-    """从 __sandbox__ 拿回 SandBox 对象(.__self__ 就是它)。"""
-    return __sandbox__.can.__self__
+    """从 __sandbox__ 拿回 SandBox 对象。
+
+    老写法 `__sandbox__.can.__self__` 在当前模块上会 AttributeError:
+    SandboxView 为了不留"属性 -> 宿主对象"的直连,把绑定方法藏进了闭包格子
+    (`SandboxView.__init__` 的 S1 注释),实例属性是不带 __self__ 的普通函数。
+    于是顺闭包取:`can.__closure__[0].cell_contents` 是绑定的 sb.can,
+    它的 `__self__` 才是 SandBox 本体。
+
+    (这条仍属 SANDBOX.md 里"同进程内省无法根治"的上限 —— escape3 的
+    `_sealed()` 用的也是同一手法。)
+    """
+    try:
+        bound = __sandbox__.can.__closure__[0].cell_contents
+        return bound.__self__
+    except Exception:
+        return __sandbox__.can.__self__
 
 
 def _globals():
@@ -206,8 +230,21 @@ def step_05_spoof_can():
 # ---------------------------------------------------------------- 第二段:第三批新路径
 
 def step_06_depth_blind():
-    """一行置位 depth:审计钩子第一句就 return,第二道闸全局失明。"""
-    label = '06 置位 _FRAME_LOCAL.depth -> 审计钩子全局失明'
+    """置位 depth 还灵不灵 —— **已经不灵了**(结论更正,2026-10)。
+
+    第 9 批加固之前,审计钩子 `_hook` 的第一句是
+    `if getattr(_depth,'depth',0): return`,所以 `_FRAME_LOCAL.depth += 5`
+    能让第二道闸全局失明 —— 当初 escape2 打的就是这句。
+
+    现在 `install_audit_hook()` 里虽然**仍然**捕获了 `_depth = _FRAME_LOCAL`
+    (闭包变量还在,顺着 `__closure__` 还看得见它),但 `_hook` 里已经没有任何
+    一处读它。置位 depth 不再影响任何判据,所以这条现在期望 **BLOCK** ——
+    真被拦下才说明钩子还在正常工作。
+
+    保留这条探针的理由:它给 step_11 的组合拳当反面对照(组合拳里还在用 depth,
+    于是一起失效),也免得后来人照着旧结论继续推。
+    """
+    label = '06 置位 _FRAME_LOCAL.depth(第 9 批后已失效,期望 BLOCK)'
     local = _globals().get('_FRAME_LOCAL')
     if local is None:
         _rec(label, 'N/A', '模块里没有 _FRAME_LOCAL')
@@ -342,8 +379,14 @@ def step_10_clear_frame_registry():
 # ---------------------------------------------------------------- 第三段:完整走出去
 
 def step_11_full_escape():
-    """组合拳:致盲钩子之后用真 os 读 + 越权写 + 起进程。"""
-    label = '11 组合拳:读外面 + 越权写 + 起进程(写完立刻删)'
+    """组合拳:真 os 读 + 越权写 + 起进程(写完立刻删)。
+
+    **预期 BLOCK**(结论更正,2026-10):这条组合拳建立在 step_06 的
+    `_FRAME_LOCAL.depth` 致盲之上,而那条已经失效(见 step_06)—— 所以这里的
+    真 os 调用会被审计钩子当场拦下。留着它是为了记下"老组合拳已死",不是当成
+    还能用的路。
+    """
+    label = '11 组合拳(依赖已失效的 depth,期望 BLOCK):读外面 + 越权写 + 起进程'
     g = _globals()
     local = g.get('_FRAME_LOCAL')
     if local is None:
@@ -432,11 +475,19 @@ def step_13_fake_filename_after():
         "real = PAYLOAD['os']\n"
         "def cb():\n"
         "    real.system('echo ESCAPE2-AFTER-FAKE-FRAME')\n"
+        "OUT['cb'] = cb\n"
     )
-    ns = {'PAYLOAD': {'os': g['os']}}
+    # 注意:插件里的 exec 是沙盒门面的 sandbox_exec,它用 _scope() 把 globals
+    # **浅拷一层**(见 plugin_sandboxa.py 的 S6 注释),所以顶层 `def cb` 写不回
+    # ns 本身(老写法 `ns['cb']` 会 KeyError)。改成往内层可变容器 OUT 里塞 ——
+    # 浅拷贝不影响这个内层 dict。
+    ns = {'PAYLOAD': {'os': g['os']}, 'OUT': {}}
     try:
         exec(compile(src, '<not-a-plugin>', 'exec'), ns)
-        cb = ns['cb']                      # 这个函数的 co_filename 是 <not-a-plugin>
+        cb = ns['OUT'].get('cb')           # 这个函数的 co_filename 是 <not-a-plugin>
+        if cb is None:
+            _rec(label, 'N/A', '伪造帧里的回调没有传出来(门面 exec 的 globals 被拷了一层)')
+            return
         pro.app.after(0, cb)
         g['time'].sleep(0.2)
     except SandboxDenied as e:
